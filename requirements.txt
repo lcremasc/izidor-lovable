@@ -1,0 +1,15 @@
+fastapi==0.115.6
+uvicorn==0.32.1
+httpx==0.28.1
+python-multipart==0.0.20
+
+# PDF / OCR
+pymupdf==1.25.5
+pytesseract==0.3.13
+Pillow==11.1.0
+
+# Excel
+openpyxl==3.1.5
+
+# já incluídas no stdlib:
+# asyncio, base64, json, os, re, shutil, subprocess, tempfile, time, pathlib
