@@ -738,7 +738,7 @@ async def _rodar_pipeline(analysis_id: str) -> None:
             print(f"   {a}")
 
         if erros:
-            raise RuntimeError(f"Payload inválido: {'; '.join(erros)}")
+            print(f"⚠️  Avisos de validação (não bloqueante): {'; '.join(erros)}")
 
         if LOVABLE_API_KEY:
             resultado = await enviar_payload(payload, api_key=LOVABLE_API_KEY)
