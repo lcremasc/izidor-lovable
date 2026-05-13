@@ -523,6 +523,88 @@ def _fundir_p2(parciais: list[dict]) -> dict:
     return base
 
 
+def _p1_minimo(cnpj: str, motivo: str, raw_response: str = "") -> dict:
+    """
+    Retorna um dict_p1 mínimo quando a E1 falha (timeout, JSON inválido, etc).
+    Mantém o pipeline rodando — o que faltar aqui é complementado pela E2
+    via _completar_p1_com_p2.
+    """
+    return {
+        "company_name":         None,
+        "cnpj":                 cnpj,
+        "sector":               None,
+        "logo_url":             None,
+        "company_image":        None,
+        "store_images":         [],
+        "ranking_setorial":     None,
+        "cidades_atuacao":      [],
+        "noticias_relevantes":  [],
+        "qsa":                  [],
+        "alertas_p1":           [f"E1 falhou: {motivo}. p1 mínimo gerado — QSA será preenchido pela E2 se o Serasa estiver presente."],
+        "_e1_error":            {"motivo": motivo, "raw_response_trecho": (raw_response or "")[:1000]},
+    }
+
+
+def _completar_p1_com_p2(p1: dict, p2: dict) -> dict:
+    """
+    Enriquecimento pós-E2: preenche campos de p1 que vieram null/vazios usando
+    o que a E2 extraiu dos documentos (Serasa, Quod, etc.).
+
+    Hoje cobre:
+      - qsa  ← p2.dados_cadastrais_raiz[].qsa[]  (Serasa traz QSA com participação)
+      - company_name  ← p2.dados_cadastrais_raiz[].razao_social
+      - sector        ← p2.dados_cadastrais_raiz[].cnae_principal_descricao  (fallback)
+
+    A primazia é sempre da E1 (fontes públicas verificadas). A E2 só preenche
+    quando E1 não trouxe nada. Cada preenchimento é registrado em alertas_p1.
+
+    Retorna um novo dict (não muta o p1 original).
+    """
+    p1 = dict(p1)  # cópia rasa
+    alertas = list(p1.get("alertas_p1") or [])
+
+    # Coletar o QSA consolidado das raízes (cada raiz pode ter QSA própria)
+    raizes = p2.get("dados_cadastrais_raiz") or []
+    qsa_consolidado: list[dict] = []
+    for raiz in raizes:
+        for socio in (raiz.get("qsa") or []):
+            # Evitar duplicidade por nome (chave mais estável que CPF parcial)
+            nome = (socio.get("nome_socio") or socio.get("nome") or "").strip().upper()
+            if nome and not any(
+                (s.get("nome_socio") or s.get("nome") or "").strip().upper() == nome
+                for s in qsa_consolidado
+            ):
+                qsa_consolidado.append(socio)
+
+    # 1) QSA — preenche se p1 não trouxe ou trouxe vazio
+    qsa_p1 = p1.get("qsa") or []
+    if not qsa_p1 and qsa_consolidado:
+        p1["qsa"] = qsa_consolidado
+        alertas.append(
+            f"QSA preenchido a partir da E2 ({len(qsa_consolidado)} sócio(s) extraído(s) "
+            f"dos relatórios Serasa/Quod) — não encontrado em fontes públicas pela E1."
+        )
+
+    # 2) company_name — fallback do nome via dados cadastrais do bureau
+    if not p1.get("company_name") and raizes:
+        razao = raizes[0].get("razao_social") or raizes[0].get("nome_empresarial")
+        if razao:
+            p1["company_name"] = razao
+            alertas.append("company_name preenchido a partir da E2 (relatório de bureau).")
+
+    # 3) sector — fallback via descrição do CNAE principal
+    if not p1.get("sector") and raizes:
+        cnae_desc = raizes[0].get("cnae_principal_descricao") or raizes[0].get("cnae_descricao")
+        if cnae_desc:
+            p1["sector"] = cnae_desc
+            alertas.append("sector preenchido a partir da E2 (CNAE principal do bureau).")
+
+    if alertas != (p1.get("alertas_p1") or []):
+        p1["alertas_p1"] = alertas
+
+    return p1
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -603,9 +685,17 @@ async def _rodar_pipeline(analysis_id: str) -> None:
                 modelo=MODELO_E1,
             )
 
-            p1 = _extrair_json(texto_e1)
-            empresa = p1.get("company_name", cnpj)
-            print(f"✅ E1 concluído em {time.monotonic()-t0:.1f}s | empresa: {empresa}")
+            try:
+                p1 = _extrair_json(texto_e1)
+                empresa = p1.get("company_name", cnpj)
+                print(f"✅ E1 concluído em {time.monotonic()-t0:.1f}s | empresa: {empresa}")
+            except ValueError as exc:
+                # E1 não retornou JSON parseável — segue com p1 mínimo, QSA virá da E2
+                print(f"⚠️  E1 falhou ao extrair JSON: {exc}")
+                print(f"   Trecho da resposta bruta: {texto_e1[:300]!r}")
+                p1 = _p1_minimo(cnpj=cnpj, motivo=str(exc), raw_response=texto_e1)
+                empresa = cnpj  # ainda não temos o nome — será preenchido pela E2
+                print(f"   Seguindo com p1 mínimo. Pipeline continua para E2.")
             await _sb_patch("analyses", analysis_id, {"p1": p1})
 
             # ── E2: Extração de documentos ────────────────────────────────
@@ -671,6 +761,20 @@ async def _rodar_pipeline(analysis_id: str) -> None:
             p2["produto_prioritario"] = produto
 
         print(f"✅ E2 concluído em {time.monotonic()-t0:.1f}s")
+
+        # ── Enriquecimento p1 com dados da E2 (QSA do Serasa, etc.) ──
+        p1_antes = p1
+        p1 = _completar_p1_com_p2(p1, p2)
+        if p1 is not p1_antes and p1.get("alertas_p1") != p1_antes.get("alertas_p1"):
+            novos = [a for a in (p1.get("alertas_p1") or [])
+                     if a not in (p1_antes.get("alertas_p1") or [])]
+            for a in novos:
+                print(f"   🔄 {a}")
+            # Persistir p1 enriquecido
+            await _sb_patch("analyses", analysis_id, {"p1": p1})
+            # Atualizar nome da empresa se foi preenchido pela E2
+            if p1.get("company_name") and empresa == cnpj:
+                empresa = p1["company_name"]
 
         # Validar p2 e logar alertas (não bloqueia)
         alertas = validar_p2(p2)
