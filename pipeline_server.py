@@ -844,14 +844,22 @@ async def _rodar_pipeline(analysis_id: str) -> None:
         if erros:
             print(f"⚠️  Avisos de validação (não bloqueante): {'; '.join(erros)}")
 
-        if LOVABLE_API_KEY:
-            resultado = await enviar_payload(payload, api_key=LOVABLE_API_KEY)
-            if resultado.sucesso:
-                print(f"✅ Payload enviado — HTTP {resultado.status_code} em {resultado.duracao_s}s")
-            else:
-                print(f"⚠️  Falha no envio: {resultado.erro} (análise salva no Supabase)")
+        if PIPELINE_SECRET:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        "https://dttaxfnfflgqqetqdyir.supabase.co/functions/v1/analyses-to-credit-analyses",
+                        json={"analysis_id": analysis_id},
+                        headers={"x-pipeline-secret": PIPELINE_SECRET},
+                    )
+                if 200 <= resp.status_code < 300:
+                    print(f"✅ Análise enviada para credit-analyses — HTTP {resp.status_code}")
+                else:
+                    print(f"⚠️  Falha no envio para credit-analyses: HTTP {resp.status_code} — {resp.text[:300]}")
+            except Exception as exc:
+                print(f"⚠️  Erro ao chamar credit-analyses: {exc} (análise salva no Supabase)")
         else:
-            print("ℹ️  LOVABLE_API_KEY não definida — payload não enviado ao endpoint externo")
+            print("ℹ️  PIPELINE_SECRET não definida — análise não enviada ao endpoint externo")
 
         # Marcar como concluído
         await _sb_patch("analyses", analysis_id, {"status": "done"})
