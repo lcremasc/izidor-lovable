@@ -343,7 +343,28 @@ def calcular_faturamento(faturamento_mensal: list[dict]) -> dict:
     if not faturamento_mensal:
         return {}
 
+    # Inferir year e month do campo `period` (formato "YYYY-MM") quando ausentes
+    # ou null. O ano extraído é dinâmico — vem do próprio valor do period de cada item.
+    # E2 às vezes preenche apenas o period como string e deixa year/month null.
+    for r in faturamento_mensal:
+        if not r.get("year") and r.get("period"):
+            try:
+                r["year"] = int(str(r["period"]).split("-")[0])
+            except (ValueError, IndexError):
+                pass  # period não é parseable — segue sem year
+        if not r.get("month") and r.get("period"):
+            try:
+                r["month"] = int(str(r["period"]).split("-")[1])
+            except (ValueError, IndexError):
+                pass
+
     anos = sorted({r["year"] for r in faturamento_mensal if r.get("year")})
+
+    # Proteção: se nem o year direto nem o period eram extraíveis, anos fica vazio.
+    # Não há como construir período da série — retornar dict vazio.
+    # Itens com year=null devem idealmente ser filtrados pelo PROMPT_01 antes de chegar aqui.
+    if not anos:
+        return {}
 
     # Organizar por (ano, mês)
     tabela: dict[tuple, float] = {}
