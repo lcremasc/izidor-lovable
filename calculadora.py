@@ -1222,12 +1222,309 @@ def calcular_grupo_economico(
 
 
 # ---------------------------------------------------------------------------
+# 17. PRODUTOS DE CRÉDITO — Cenários de limite por rating
+# ---------------------------------------------------------------------------
+
+# Tabela n_rating Política CG Cartão v03
+_N_RATING = {
+    "AA": 2.0,
+    "A":  1.5,
+    "B":  1.5,
+    "C":  1.0,
+    "D":  0.5,
+    "E":  0.5,
+    # F, G, H = recusa
+}
+
+# Percentuais CG Clean (% Receita Bruta anualizada por rating)
+_PCT_CG_CLEAN = {"AA": 0.10, "A": 0.10, "B": 0.10, "C": 0.07, "D": 0.05, "E": 0.05}
+
+# Percentuais Antecipação Risco Sacado / Cedente / Não Performado / Convênio (% capacidade pgto mensal)
+_PCT_ANTECIPACAO = {"AA": 0.40, "A": 0.40, "B": 0.40, "C": 0.30, "D": 0.20, "E": 0.20}
+
+# Percentuais CG Cessão Fid Duplicatas (% giro mensal duplicatas)
+_PCT_DUPLICATAS = {"AA": 0.50, "A": 0.50, "B": 0.50, "C": 0.30, "D": 0.20, "E": 0.20}
+
+# Cap operacional Produto 2 (CG Cessão Fid. Cartão)
+_CAP_CARTAO = 15_000_000.0
+
+# Teto operacional n_efetivo
+_TETO_N_EFETIVO = 3.0
+
+
+def _ajuste_idade(anos: float | int | None) -> float:
+    """Curva Sebrae para comércio. Política v03."""
+    if anos is None:
+        return 1.00  # default conservador
+    if anos < 2:
+        return 0.70  # política não cobre <2 anos; aplica menor multiplicador
+    if anos <= 3:
+        return 0.70
+    if anos <= 5:
+        return 0.90
+    return 1.00
+
+
+def _ajuste_tendencia(yoy: float | None) -> tuple[float, str]:
+    """
+    Política v03. yoy é decimal (ex: 0.12 = +12%).
+    Retorna (multiplicador, faixa_textual).
+    """
+    if yoy is None:
+        return 1.00, "Tendência não calculável — assumido estável"
+    if yoy < -0.25:
+        return 0.0, f"Queda forte ({yoy*100:.1f}%) — RECUSA pela política"
+    if yoy < -0.15:
+        return 0.60, f"Queda moderada ({yoy*100:.1f}%)"
+    if yoy < -0.05:
+        return 0.85, f"Queda leve ({yoy*100:.1f}%)"
+    return 1.00, f"Tendência estável/positiva ({yoy*100:.1f}%)"
+
+
+def _cenarios_n_efetivo(ajuste_idade: float, ajuste_tendencia: float) -> dict[str, float]:
+    """Calcula n_efetivo para cada rating, respeitando teto operacional."""
+    return {
+        rating: min(n * ajuste_idade * ajuste_tendencia, _TETO_N_EFETIVO)
+        for rating, n in _N_RATING.items()
+    }
+
+
+def calcular_produtos_credito(
+    p1: dict | None,
+    p2: dict,
+    p3_parcial: dict,
+) -> dict:
+    """
+    Gera cenários de limite por rating para cada um dos 7 produtos da política Izi Cash.
+
+    Inputs:
+      p1: dict_p1 (pra anos_operacao). Pode ser None — fallback usa dados_cadastrais ou default.
+      p2: dict_p2 completo.
+      p3_parcial: dict_p3 sendo construído (precisa de receita, faturamento, capital_giro, transacional_nuclea).
+
+    Output: dict com fmm_cartao, capacidade_pgto_mensal, giro_duplicatas_mensal, ajustes_comuns
+            e cenarios_por_produto[produto][rating] = {n_rating, limite_bruto, limite_final, parcela_mensal}.
+    """
+
+    # ---- 1. Inputs de fontes ----
+    bureaux  = p2.get("bureaux", {}) or {}
+    nuclea   = bureaux.get("nuclea") or {}
+    cerc_raw = _get(p2, "commercial_inputs", "cerc")
+    balanco  = p2.get("balanco", [])
+
+    # Anos de operação (p1 preferencial)
+    anos_op = None
+    if p1:
+        anos_op = p1.get("anos_operacao")
+    if anos_op is None:
+        # fallback simples: ignora
+        anos_op = None
+
+    # Tendência YoY entre os 2 últimos anos completos do faturamento
+    yoy = None
+    var_anual = _get(p3_parcial, "faturamento", "variacao_anual", default={}) or {}
+    # pega a última variação entre dois anos completos (chave do tipo "variacao_YYYY_YYYY")
+    chaves_var = sorted([k for k in var_anual if k.startswith("variacao_")])
+    if chaves_var:
+        # ignora a última se envolver ano parcial (heurística simples)
+        # Por segurança, pega penúltima quando existir
+        if len(chaves_var) >= 2:
+            yoy = var_anual.get(chaves_var[-2])
+        else:
+            yoy = var_anual.get(chaves_var[-1])
+
+    ajuste_id  = _ajuste_idade(anos_op)
+    ajuste_ten, faixa_ten = _ajuste_tendencia(yoy)
+    n_efetivos = _cenarios_n_efetivo(ajuste_id, ajuste_ten)
+
+    # ---- 2. FMM Cartão (Produto 2) ----
+    # Hierarquia: CERC > Núclea total transacional > null
+    fmm_cartao  = None
+    fmm_fonte   = None
+    fmm_alertas = []
+
+    if cerc_raw:
+        # Soma agenda dos últimos 12 meses
+        historico = []
+        for item in cerc_raw.get("raw_items", []):
+            historico.extend(item.get("historico_agenda", []))
+        vals = [h["valor_liquidado"] for h in historico if h.get("valor_liquidado") is not None]
+        if vals:
+            fmm_cartao = _round(sum(vals) / len(vals), 2)
+            fmm_fonte  = "CERC (agenda 12 meses, fonte primária)"
+
+    if fmm_cartao is None:
+        fat_trans = nuclea.get("faturamento_transacional")
+        if fat_trans is not None:
+            fmm_cartao = _round(fat_trans / 12, 2)
+            fmm_fonte  = "Núclea faturamento_transacional ÷ 12 (fonte secundária oficial)"
+            fmm_alertas.append("FMM via Núclea — agenda CERC requerida para confirmação definitiva")
+
+    if fmm_cartao is None:
+        fmm_alertas.append("Nem CERC nem Núclea disponíveis — Produto 2 deve ser APROVADO COM CONDIÇÕES exigindo CERC antes de calcular")
+
+    # ---- 3. Capacidade de pagamento mensal (Produtos 3, 4, 5, 7) ----
+    # Hierarquia: nuclea.pagamento_mensal_projetado > nuclea.valores_pagos ÷ 12 > DRE/12 × 0.5
+    capacidade = None
+    cap_fonte  = None
+    cap_alertas = []
+
+    proj = nuclea.get("pagamento_mensal_projetado")
+    if proj is not None:
+        capacidade = _round(proj, 2)
+        cap_fonte  = "Núclea pagamento_mensal_projetado (preferencial)"
+    else:
+        val_pagos = nuclea.get("valores_pagos")
+        if val_pagos is not None:
+            capacidade = _round(val_pagos / 12, 2)
+            cap_fonte  = "Núclea valores_pagos ÷ 12 (fallback)"
+        else:
+            rl_anual = _anualizar_campo(p2.get("dre", []), "receita_liquida")
+            if rl_anual is not None:
+                capacidade = _round(rl_anual / 12 * 0.5, 2)
+                cap_fonte  = "DRE: Receita Líquida anualizada ÷ 12 × 0,5 (último fallback)"
+                cap_alertas.append("Capacidade pgto estimada via DRE — preferível ter Núclea")
+
+    if capacidade is None:
+        cap_alertas.append("Sem dados para estimar capacidade pgto mensal — produtos 3/4/5/7 dependem de complementação")
+
+    # ---- 4. Giro mensal de duplicatas (Produto 6) ----
+    # Usa Contas a Receber do balanço mais recente / 30 dias (giro mensal aproximado)
+    giro_dup = None
+    giro_fonte = None
+    giro_alertas = []
+
+    _, bal_atual = _balanco_mais_recente(balanco)
+    if bal_atual:
+        cr = _get(bal_atual, "itens", "creditos")
+        if cr is not None:
+            # Contas a receber / 30 = giro diário; ×30 dá giro mensal... mas o pedido é "giro 30 dias"
+            # Interpretação: contas a receber representa ~30 dias de giro (PMR ≈ 17,8d na Arco-Mix, ~30d aceitável)
+            # Então giro mensal = contas a receber tal como está (representa 1 mês de fluxo)
+            giro_dup = _round(cr, 2)
+            giro_fonte = "Contas a Receber do balanço (proxy de giro mensal — PMR ~30 dias)"
+        else:
+            giro_alertas.append("Contas a Receber não disponível no balanço")
+
+    if giro_dup is None:
+        giro_alertas.append("Sem dados de duplicatas — Produto 6 depende de relatório específico de carteira")
+
+    # ---- 5. Cenários por produto ----
+
+    def cenarios_simples(
+        base: float | None,
+        pct_por_rating: dict[str, float],
+        cap: float | None = None,
+        prazo_meses: int = 12,
+    ) -> dict:
+        """Gera cenários para produtos cuja fórmula é (% × base × n_efetivo)."""
+        if base is None:
+            return {r: None for r in _N_RATING}
+
+        result = {}
+        for rating in _N_RATING:
+            n_ef = n_efetivos[rating]
+            pct  = pct_por_rating[rating]
+            limite_bruto = _round(pct * base * n_ef, 2)
+            limite_final = _round(min(limite_bruto, cap), 2) if cap else limite_bruto
+            parcela = _round(limite_final / prazo_meses, 2) if prazo_meses else None
+            pct_base = _div(parcela, base, 4) if parcela and base else None
+            result[rating] = {
+                "n_rating":          _N_RATING[rating],
+                "n_efetivo":         _round(n_ef, 4),
+                "pct_base":          pct,
+                "limite_bruto":      limite_bruto,
+                "limite_final":      limite_final,
+                "parcela_mensal":    parcela,
+                "pct_parcela_base":  pct_base,
+                "cap_aplicado":      bool(cap and limite_bruto > cap),
+            }
+        return result
+
+    def cenarios_cg_cartao(fmm: float | None) -> dict:
+        """Produto 2: limite = n_efetivo × FMM. Cap R$ 15M. Restrição: parcela ≤ 30% FMM."""
+        if fmm is None:
+            return {r: None for r in _N_RATING}
+
+        result = {}
+        for rating in _N_RATING:
+            n_ef = n_efetivos[rating]
+            limite_bruto = _round(n_ef * fmm, 2)
+            limite_final = _round(min(limite_bruto, _CAP_CARTAO), 2)
+            parcela = _round(limite_final / 12, 2)
+            pct_fmm = _div(parcela, fmm, 4)
+            result[rating] = {
+                "n_rating":          _N_RATING[rating],
+                "n_efetivo":         _round(n_ef, 4),
+                "limite_bruto":      limite_bruto,
+                "limite_final":      limite_final,
+                "parcela_mensal":    parcela,
+                "pct_parcela_fmm":   pct_fmm,
+                "dscr":              _round(1 / pct_fmm, 4) if pct_fmm and pct_fmm > 0 else None,
+                "cap_aplicado":      limite_bruto > _CAP_CARTAO,
+                "restricao_30pct":   "OK" if (pct_fmm is None or pct_fmm <= 0.30) else "VIOLA",
+            }
+        return result
+
+    # Receita Bruta anualizada (base do CG Clean)
+    rb_anual = _anualizar_campo(p2.get("dre", []), "receita_bruta")
+
+    cenarios = {
+        "cg_clean":                   cenarios_simples(rb_anual,   _PCT_CG_CLEAN,    cap=None, prazo_meses=24),
+        "cg_cessao_fid_cartao":       cenarios_cg_cartao(fmm_cartao),
+        "antecipacao_risco_sacado":   cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
+        "antecipacao_risco_cedente":  cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
+        "antecipacao_nao_performado": cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=12),
+        "cg_cessao_fid_duplicatas":   cenarios_simples(giro_dup,   _PCT_DUPLICATAS,  cap=None, prazo_meses=12),
+        "convenio_risco_sacado":      cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
+    }
+
+    return {
+        "fmm_cartao": {
+            "valor":   fmm_cartao,
+            "fonte":   fmm_fonte,
+            "alertas": fmm_alertas,
+        },
+        "capacidade_pgto_mensal": {
+            "valor":   capacidade,
+            "fonte":   cap_fonte,
+            "alertas": cap_alertas,
+        },
+        "giro_duplicatas_mensal": {
+            "valor":   giro_dup,
+            "fonte":   giro_fonte,
+            "alertas": giro_alertas,
+        },
+        "receita_bruta_anual": rb_anual,
+        "ajustes_comuns": {
+            "anos_operacao":         anos_op,
+            "ajuste_idade":          ajuste_id,
+            "tendencia_yoy_recente": yoy,
+            "ajuste_tendencia":      ajuste_ten,
+            "faixa_tendencia":       faixa_ten,
+            "teto_n_efetivo":        _TETO_N_EFETIVO,
+        },
+        "cap_operacional": {
+            "cg_cessao_fid_cartao": _CAP_CARTAO,
+            "demais_produtos":      None,
+        },
+        "tabela_n_rating": _N_RATING,
+        "cenarios_por_produto": cenarios,
+        "nota_uso": (
+            "O E4 escolhe o rating Izi (AA-E) baseado em análise qualitativa "
+            "(liquidez, alavancagem, scores, prejuízo). Após escolher rating, "
+            "lê limite_final do cenário correspondente. Sem haircuts adicionais."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # FUNÇÃO PRINCIPAL
 # ---------------------------------------------------------------------------
 
-def calcular(p2: dict) -> dict:
+def calcular(p2: dict, p1: dict | None = None) -> dict:
     """
-    Recebe dict_p2 e retorna dict_p3 completo.
+    Recebe dict_p2 (e opcionalmente dict_p1) e retorna dict_p3 completo.
 
     Ordem de execução:
       1.  liquidez
@@ -1240,12 +1537,13 @@ def calcular(p2: dict) -> dict:
       8.  capital_giro
       9.  estrutura_capital
       10. scr_bacen
-      11. cartao_recebiveis
+      11. cartao_recebiveis (indicadores brutos de CERC/Núclea)
       12. eficiencia_operacional
       13. transacional_nuclea
       14. restritivos_bureau
       15. restritivos_relativos
       16. grupo_economico
+      17. produtos_credito (cenários de limite por rating, com cap R$ 15M no Produto 2)
     """
     balanco    = p2.get("balanco", [])
     dre        = p2.get("dre", [])
@@ -1305,6 +1603,16 @@ def calcular(p2: dict) -> dict:
     # 17. Grupo econômico
     grupo = calcular_grupo_economico(p2, dre, scr_raw)
 
+    # 18. Produtos de crédito (cenários de limite por rating)
+    # Construído por último porque depende de outros indicadores já calculados
+    p3_parcial = {
+        "receita":              receita,
+        "faturamento":          faturamento,
+        "capital_giro":         capital_giro,
+        "transacional_nuclea":  transacional,
+    }
+    produtos_credito = calcular_produtos_credito(p1, p2, p3_parcial)
+
     return {
         "liquidez":               liquidez,
         "margens":                margens,
@@ -1322,4 +1630,5 @@ def calcular(p2: dict) -> dict:
         "restritivos_bureau":     restritivos,
         "restritivos_relativos":  rest_rel,
         "grupo_economico":        grupo,
+        "produtos_credito":       produtos_credito,
     }
