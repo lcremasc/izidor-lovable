@@ -46,8 +46,8 @@ STORAGE_BUCKET        = "analysis-files"
 API_URL               = "https://api.anthropic.com/v1/messages"
 
 MODELO_E1             = "claude-haiku-4-5-20251001"
-MODELO_E2             = "claude-sonnet-4-20250514"
-MODELO_E4             = "claude-sonnet-4-20250514"
+MODELO_E2             = "claude-sonnet-4-6"
+MODELO_E4             = "claude-sonnet-4-6"
 
 MAX_TOKENS_E1         = 8_000
 MAX_TOKENS_E2         = 16_000
