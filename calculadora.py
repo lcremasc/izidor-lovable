@@ -92,13 +92,26 @@ def _anualizar_campo(dre: list[dict], campo: str) -> float | None:
     """
     Retorna o valor de `campo` do período mais recente da DRE, anualizado.
     Fórmula: valor × (365 / dias_do_período)
+
+    Para os campos derivados 'ebit', 'ebitda', 'lucro_bruto', aplica a hierarquia
+    de cálculo de _calcular_lucro_bruto_ebit_ebitda quando vêm null no p2.
     """
     periodo = _dre_mais_recente(dre)
     if not periodo:
         return None
-    val = periodo.get("itens", {}).get(campo)
+
+    itens = periodo.get("itens", {})
+
+    # Para campos derivados, aplica hierarquia de fallback
+    if campo in ("ebit", "ebitda", "lucro_bruto"):
+        calc = _calcular_lucro_bruto_ebit_ebitda(itens)
+        val = calc.get(campo)
+    else:
+        val = itens.get(campo)
+
     if val is None:
         return None
+
     ini = periodo.get("data_inicio", "")
     fim = periodo.get("data_fim", "")
     return val * _fator_anualização(ini, fim)
@@ -155,6 +168,104 @@ def calcular_liquidez(balanco: list[dict]) -> dict:
 # 2. MARGENS
 # ---------------------------------------------------------------------------
 
+def _calcular_lucro_bruto_ebit_ebitda(itens: dict) -> dict:
+    """
+    Aplica a hierarquia de fallback para Lucro Bruto, EBIT e EBITDA quando vêm null no p2.
+
+    Hierarquia:
+      Lucro Bruto:
+        1. Usa valor explícito do p2 se existir
+        2. Senão, calcula: Receita Líquida − |CMV|
+
+      EBIT:
+        1. Usa valor explícito do p2 se existir
+        2. Senão, calcula: Lucro Bruto − |Despesas Operacionais| + Outras Receitas Operacionais
+           (Outras Receitas Op tratadas como parte do resultado operacional)
+
+      EBITDA:
+        1. Usa valor explícito do p2 se existir
+        2. Se Depreciação existe: EBITDA = EBIT + |Depreciação|
+        3. Se Depreciação null: EBITDA = EBIT (subestimado, com aviso)
+
+    Retorna dict com:
+      lucro_bruto, ebit, ebitda          → valores finais (calculados ou do p2)
+      lucro_bruto_origem, ebit_origem, ebitda_origem  → "p2" ou "calculado"
+      alertas → lista de avisos
+    """
+    rl       = itens.get("receita_liquida")
+    cmv      = itens.get("cmv")
+    lb_p2    = itens.get("lucro_bruto")
+    desp_op  = itens.get("despesas_operacionais")
+    out_rec  = itens.get("outras_receitas_operacionais") or 0
+    ebit_p2  = itens.get("ebit")
+    deprec   = itens.get("depreciacao")
+    ebitda_p2 = itens.get("ebitda")
+
+    alertas = []
+
+    # --- Lucro Bruto ---
+    if lb_p2 is not None:
+        lb         = lb_p2
+        lb_origem  = "p2"
+        lb_formula = "valor do p2"
+    elif rl is not None and cmv is not None:
+        lb         = _round(rl - abs(cmv), 2)
+        lb_origem  = "calculado"
+        lb_formula = "Receita Líquida − |CMV|"
+    else:
+        lb         = None
+        lb_origem  = "indisponivel"
+        lb_formula = None
+        alertas.append("Lucro Bruto não disponível: faltam Receita Líquida e/ou CMV no p2")
+
+    # --- EBIT ---
+    if ebit_p2 is not None:
+        ebit         = ebit_p2
+        ebit_origem  = "p2"
+        ebit_formula = "valor do p2"
+    elif lb is not None and desp_op is not None:
+        ebit         = _round(lb - abs(desp_op) + out_rec, 2)
+        ebit_origem  = "calculado"
+        ebit_formula = "Lucro Bruto − |Despesas Operacionais| + Outras Receitas Operacionais"
+    else:
+        ebit         = None
+        ebit_origem  = "indisponivel"
+        ebit_formula = None
+        alertas.append("EBIT não disponível: faltam Lucro Bruto e/ou Despesas Operacionais")
+
+    # --- EBITDA ---
+    if ebitda_p2 is not None:
+        ebitda         = ebitda_p2
+        ebitda_origem  = "p2"
+        ebitda_formula = "valor do p2"
+    elif ebit is not None and deprec is not None:
+        ebitda         = _round(ebit + abs(deprec), 2)
+        ebitda_origem  = "calculado"
+        ebitda_formula = "EBIT + |Depreciação|"
+    elif ebit is not None and deprec is None:
+        ebitda         = ebit
+        ebitda_origem  = "calculado_sem_depreciacao"
+        ebitda_formula = "EBIT (depreciação indisponível — EBITDA subestimado)"
+        alertas.append("EBITDA ≈ EBIT: depreciação não disponível no p2, EBITDA pode estar subestimado")
+    else:
+        ebitda         = None
+        ebitda_origem  = "indisponivel"
+        ebitda_formula = None
+
+    return {
+        "lucro_bruto":        lb,
+        "lucro_bruto_origem": lb_origem,
+        "lucro_bruto_formula": lb_formula,
+        "ebit":               ebit,
+        "ebit_origem":        ebit_origem,
+        "ebit_formula":       ebit_formula,
+        "ebitda":             ebitda,
+        "ebitda_origem":      ebitda_origem,
+        "ebitda_formula":     ebitda_formula,
+        "alertas":            alertas,
+    }
+
+
 def calcular_margens(dre: list[dict]) -> list[dict]:
     """
     Margens por período disponível na DRE.
@@ -165,6 +276,9 @@ def calcular_margens(dre: list[dict]) -> list[dict]:
       margem_ebitda   = EBITDA / Receita Líquida
       margem_ebit     = EBIT / Receita Líquida
       margem_liquida  = Lucro Líquido / Receita Líquida
+
+    Para Lucro Bruto, EBIT e EBITDA, aplica hierarquia de fallback via
+    _calcular_lucro_bruto_ebit_ebitda quando vêm null no p2.
     """
     resultado = []
     for periodo in dre:
@@ -173,24 +287,34 @@ def calcular_margens(dre: list[dict]) -> list[dict]:
         fim      = periodo.get("data_fim", "")
         label    = f"{inicio} a {fim}"
 
-        rl  = itens.get("receita_liquida")        # denominador = RL
-        lb  = itens.get("lucro_bruto")
-        ebt = itens.get("ebitda")
-        ebit_val = itens.get("ebit")
-        ebt_calc = ebit_val if ebit_val is not None else itens.get("lucro_operacional")
+        rl  = itens.get("receita_liquida")
         ll  = itens.get("lucro_liquido")
+
+        # Aplica hierarquia de cálculo para Lucro Bruto, EBIT e EBITDA
+        calc = _calcular_lucro_bruto_ebit_ebitda(itens)
 
         resultado.append({
             "periodo":        label,
-            "margem_bruta":   _div(lb,       rl),
-            "margem_ebitda":  _div(ebt,      rl),
-            "margem_ebit":    _div(ebt_calc, rl),
-            "margem_liquida": _div(ll,       rl),
+            "margem_bruta":   _div(calc["lucro_bruto"], rl),
+            "margem_ebitda":  _div(calc["ebitda"],      rl),
+            "margem_ebit":    _div(calc["ebit"],        rl),
+            "margem_liquida": _div(ll,                  rl),
+            # Valores absolutos calculados (úteis para downstream)
+            "lucro_bruto":          calc["lucro_bruto"],
+            "lucro_bruto_origem":   calc["lucro_bruto_origem"],
+            "ebit":                 calc["ebit"],
+            "ebit_origem":          calc["ebit_origem"],
+            "ebitda":               calc["ebitda"],
+            "ebitda_origem":        calc["ebitda_origem"],
+            "alertas_calculo":      calc["alertas"],
             # fórmulas
             "margem_bruta_formula":   "Lucro Bruto / Receita Líquida",
             "margem_ebitda_formula":  "EBITDA / Receita Líquida",
             "margem_ebit_formula":    "EBIT / Receita Líquida",
             "margem_liquida_formula": "Lucro Líquido / Receita Líquida",
+            "lucro_bruto_formula":    calc["lucro_bruto_formula"],
+            "ebit_formula":           calc["ebit_formula"],
+            "ebitda_formula":         calc["ebitda_formula"],
         })
     return resultado
 
