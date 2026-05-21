@@ -637,8 +637,8 @@ async def _rodar_pipeline(analysis_id: str) -> None:
 
         # Buscar prompts do Supabase
         p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v5&select=content")
-        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8&select=content")
-        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v2&select=content")
+        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v7&select=content")
+        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v1&select=content")
 
         if not p_e1_rows or not p_e2_rows or not p_e4_rows:
             raise RuntimeError("Um ou mais prompts não encontrados na tabela 'prompts'")
@@ -784,10 +784,11 @@ async def _rodar_pipeline(analysis_id: str) -> None:
 
         await _sb_patch("analyses", analysis_id, {"p2": p2})
 
-        # ── E3: Calculadora (Python puro — usa calculadora.py sem alteração) ──
+        # ── E3: Calculadora (Python puro — usa calculadora.py) ──
+        # Passa p1 para que calcular_produtos_credito possa usar anos_operacao
         print("\n⚙️  E3 — Calculadora...")
         t0 = time.monotonic()
-        p3 = calcular(p2)
+        p3 = calcular(p2, p1=p1)
         print(f"✅ E3 concluído em {time.monotonic()-t0:.2f}s — {len(p3)} blocos")
         await _sb_patch("analyses", analysis_id, {"p3": p3})
 
