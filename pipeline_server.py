@@ -50,8 +50,8 @@ MODELO_E2             = "claude-sonnet-4-6"
 MODELO_E4             = "claude-sonnet-4-6"
 
 MAX_TOKENS_E1         = 8_000
-MAX_TOKENS_E2         = 16_000
-MAX_TOKENS_E4         = 16_000
+MAX_TOKENS_E2         = 32_000
+MAX_TOKENS_E4         = 32_000
 CHUNK_DOCS            = 1         # 1 doc por vez — seguro para PDFs grandes
 SLEEP_ENTRE_LOTES     = 30        # segundos entre lotes
 TIMEOUT               = 300       # segundos por chamada à API Anthropic
