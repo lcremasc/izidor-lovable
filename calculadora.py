@@ -692,8 +692,12 @@ def calcular_rentabilidade(
     periodo  = f"{inicio} a {fim}"
 
     ll       = itens.get("lucro_liquido")
-    ebit_val = itens.get("ebit")
-    ebit     = ebit_val if ebit_val is not None else itens.get("lucro_operacional")
+
+    # EBIT — aplica hierarquia de cálculo (igual margens) quando vier null no p2
+    calc = _calcular_lucro_bruto_ebit_ebitda(itens)
+    ebit        = calc["ebit"]
+    ebit_origem = calc["ebit_origem"]
+    ebit_formula_calc = calc["ebit_formula"]
 
     # Fator de anualização
     fator = _fator_anualização(inicio, fim)
@@ -710,6 +714,10 @@ def calcular_rentabilidade(
         "roa":      _div(ll_anual, at),
         "roe":      _div(ll_anual, pl),
         "roce":     _div(ebit_anual, ce),
+        # rastreabilidade
+        "ebit_anual_usado":     ebit_anual,
+        "ebit_origem":          ebit_origem,
+        "ebit_formula_calculo": ebit_formula_calc,
         # fórmulas
         "roa_formula":  "Lucro Líquido anualizado / Ativo Total",
         "roe_formula":  "Lucro Líquido anualizado / Patrimônio Líquido",
@@ -971,7 +979,7 @@ def calcular_scr(scr_raw: dict | None) -> dict:
         "perda_carteira":                _round(perda, 2),
         "credito_perda":                 _round(perda, 2),
         "limite_credito_total":          _round(limite, 2),
-        "credito_utilizado_limite":      _div(carteira, limite),
+        "credito_utilizado_limite":      _div(carteira, (carteira + limite) if carteira is not None and limite is not None else None),
         "numero_operacoes_credito":      num_ops,
         "numero_instituicoes_financeiras": num_ifs,
         "tempo_relacionamento_bancario": tempo_rel,
@@ -982,7 +990,7 @@ def calcular_scr(scr_raw: dict | None) -> dict:
         "divida_total":                  _round(total_modal, 2),
         # fórmulas
         "overdue_carteira_formula":         "Crédito Vencido / Carteira Ativa",
-        "credito_utilizado_limite_formula": "Carteira Ativa / Limite de Crédito Total",
+        "credito_utilizado_limite_formula": "Carteira Ativa / (Carteira Ativa + Limite de Crédito Total)",
         "tempo_relacionamento_formula":     "(Data Hoje - Data Início Relacionamento) / 365",
         "pct_modalidade_formula":           "Valor Modalidade / Total Carteira Ativa",
     }
@@ -1310,7 +1318,11 @@ def calcular_grupo_economico(
         fim   = rec_periodo.get("data_fim", "")
         fator = _fator_anualização(ini, fim)
         rb    = itens.get("receita_bruta")
-        ebt   = itens.get("ebitda")
+
+        # EBITDA — aplica hierarquia de cálculo (igual margens/rentabilidade)
+        calc = _calcular_lucro_bruto_ebit_ebitda(itens)
+        ebt = calc["ebitda"]
+        ebt_origem = calc["ebitda_origem"]
 
         if rb is not None:
             receita_val = _round(rb * fator, 0)
@@ -1320,7 +1332,9 @@ def calcular_grupo_economico(
         if fator != 1.0:
             sufixo = f"anualizado (×{fator:.1f}) — apenas matriz"
             receita_obs = f"Receita Bruta {ini[:7]} a {fim[:7]} {sufixo}."
-            ebitda_obs  = f"EBITDA {ini[:7]} a {fim[:7]} {sufixo}."
+            ebitda_obs  = f"EBITDA {ini[:7]} a {fim[:7]} {sufixo} (origem: {ebt_origem})."
+        elif ebt is not None:
+            ebitda_obs = f"EBITDA {ini[:7]} a {fim[:7]} (origem: {ebt_origem})."
 
     # Restritivos consolidados (Serasa PEFIN como proxy)
     serasa = p2.get("bureaux", {}).get("serasa", {}) or {}
@@ -1360,14 +1374,28 @@ _N_RATING = {
     # F, G, H = recusa
 }
 
-# Percentuais CG Clean (% Receita Bruta anualizada por rating)
+# Percentuais CG Clean (% Receita Bruta anualizada por rating) — Produto 1
 _PCT_CG_CLEAN = {"AA": 0.10, "A": 0.10, "B": 0.10, "C": 0.07, "D": 0.05, "E": 0.05}
 
-# Percentuais Antecipação Risco Sacado / Cedente / Não Performado / Convênio (% capacidade pgto mensal)
-_PCT_ANTECIPACAO = {"AA": 0.40, "A": 0.40, "B": 0.40, "C": 0.30, "D": 0.20, "E": 0.20}
+# Percentuais Antecipação Risco Sacado / Cedente (% EBITDA anual) — Produtos 3 e 4
+_PCT_ANTECIPACAO = {"AA": 0.70, "A": 0.70, "B": 0.70, "C": 0.50, "D": 0.30, "E": 0.30}
+
+# Percentuais Não Performado (% EBITDA anual) — Produto 5 (mais conservador)
+_PCT_NAO_PERFORMADO = {"AA": 0.40, "A": 0.40, "B": 0.40, "C": 0.30, "D": 0.20, "E": 0.20}
+
+# Percentuais Convênio Risco Sacado (% Capacidade Pgto Núclea MIN/12) — Produto 7
+_PCT_CONVENIO = {"AA": 0.40, "A": 0.40, "B": 0.40, "C": 0.30, "D": 0.20, "E": 0.20}
 
 # Percentuais CG Cessão Fid Duplicatas (% giro mensal duplicatas)
 _PCT_DUPLICATAS = {"AA": 0.50, "A": 0.50, "B": 0.50, "C": 0.30, "D": 0.20, "E": 0.20}
+
+# Teto Dívida/EBITDA por rating — usado em L2 do Produto 1 (CG Clean)
+# Padrão de mercado (Bacen-aligned)
+_TETO_DIVIDA_EBITDA = {"AA": 4.5, "A": 4.0, "B": 3.5, "C": 3.0, "D": 2.5, "E": 2.0}
+
+# % DSCR (cobertura mensal) — usado em L3 do Produto 1 (CG Clean)
+# Limita a parcela mensal a esse % do EBITDA mensal
+_PCT_DSCR = {"AA": 0.30, "A": 0.30, "B": 0.30, "C": 0.25, "D": 0.20, "E": 0.20}
 
 # Cap operacional Produto 2 (CG Cessão Fid. Cartão)
 _CAP_CARTAO = 15_000_000.0
@@ -1487,44 +1515,103 @@ def calcular_produtos_credito(
     if fmm_cartao is None:
         fmm_alertas.append("Nem CERC nem Núclea disponíveis — Produto 2 deve ser APROVADO COM CONDIÇÕES exigindo CERC antes de calcular")
 
-    # ---- 3. Capacidade de pagamento mensal (Produtos 3, 4, 5, 7) ----
-    # Hierarquia: nuclea.pagamento_mensal_projetado > nuclea.valores_pagos ÷ 12 > DRE/12 × 0.5
+    # ---- 3. EBITDA anualizado e mensal ----
+    # Base primária dos produtos 1 (L2, L3), 3, 4, 5
+    ebitda_anual = _anualizar_campo(p2.get("dre", []), "ebitda")
+    ebitda_mensal = _round(ebitda_anual / 12, 2) if ebitda_anual else None
+    ebitda_alertas = []
+
+    if ebitda_anual is None:
+        ebitda_alertas.append("EBITDA não disponível mesmo após hierarquia de cálculo — produtos baseados em EBITDA serão null")
+    elif ebitda_anual <= 0:
+        ebitda_alertas.append(f"EBITDA negativo ou zero (R$ {ebitda_anual/1e6:.2f}M anual) — produtos baseados em EBITDA serão null")
+        ebitda_anual = None
+        ebitda_mensal = None
+
+    # ---- 4. Capacidade Núclea Opção D — MIN(faturamento_transacional, valores_pagos) ÷ 12 ----
+    # Usada como base primária do Produto 7 (Convênio Risco Sacado)
+    nuclea_cap_min = None
+    nuclea_cap_fonte = None
+    nuclea_alertas = []
+
+    fat_trans = nuclea.get("faturamento_transacional")
+    val_pagos = nuclea.get("valores_pagos")
+
+    if fat_trans is not None and val_pagos is not None:
+        nuclea_cap_min = _round(min(fat_trans, val_pagos) / 12, 2)
+        nuclea_cap_fonte = (
+            f"Núclea MIN(faturamento_transacional R$ {fat_trans/1e6:.1f}M, "
+            f"valores_pagos R$ {val_pagos/1e6:.1f}M) ÷ 12 = "
+            f"R$ {nuclea_cap_min/1e6:.1f}M/mês"
+        )
+        if val_pagos > fat_trans * 1.3:
+            nuclea_alertas.append(
+                f"Pagamentos Núclea ({val_pagos/1e6:.1f}M) excedem recebimentos ({fat_trans/1e6:.1f}M) "
+                "— empresa pode operar fora do circuito Núclea ou ter compromissos elevados"
+            )
+    elif fat_trans is not None:
+        nuclea_cap_min = _round(fat_trans / 12, 2)
+        nuclea_cap_fonte = "Núclea faturamento_transacional ÷ 12 (valores_pagos null)"
+    elif val_pagos is not None:
+        nuclea_cap_min = _round(val_pagos / 12, 2)
+        nuclea_cap_fonte = "Núclea valores_pagos ÷ 12 (faturamento_transacional null)"
+
+    # ---- 5. Capacidade de pagamento mensal (hierarquia geral) ----
+    # 1º EBITDA mensal | 2º Núclea MIN/12 | 3º Receita Bruta × margem média setorial ÷ 12
     capacidade = None
     cap_fonte  = None
     cap_alertas = []
 
-    proj = nuclea.get("pagamento_mensal_projetado")
-    if proj is not None:
-        capacidade = _round(proj, 2)
-        cap_fonte  = "Núclea pagamento_mensal_projetado (preferencial)"
+    if ebitda_mensal is not None:
+        capacidade = ebitda_mensal
+        cap_fonte = "EBITDA anualizado ÷ 12 (geração operacional)"
+    elif nuclea_cap_min is not None:
+        capacidade = nuclea_cap_min
+        cap_fonte = f"Fallback Núclea: {nuclea_cap_fonte}"
+        cap_alertas.append("Capacidade pgto via Núclea — EBITDA não disponível")
     else:
-        val_pagos = nuclea.get("valores_pagos")
-        if val_pagos is not None:
-            capacidade = _round(val_pagos / 12, 2)
-            cap_fonte  = "Núclea valores_pagos ÷ 12 (fallback)"
-        else:
-            rl_anual = _anualizar_campo(p2.get("dre", []), "receita_liquida")
-            if rl_anual is not None:
-                capacidade = _round(rl_anual / 12 * 0.5, 2)
-                cap_fonte  = "DRE: Receita Líquida anualizada ÷ 12 × 0,5 (último fallback)"
-                cap_alertas.append("Capacidade pgto estimada via DRE — preferível ter Núclea")
+        # Fallback final: Receita Bruta × 5% (proxy margem EBITDA setorial conservadora) ÷ 12
+        rb_anual_tmp = _anualizar_campo(p2.get("dre", []), "receita_bruta")
+        if rb_anual_tmp is not None:
+            capacidade = _round(rb_anual_tmp * 0.05 / 12, 2)
+            cap_fonte = "Receita Bruta anual × 5% ÷ 12 (fallback — sem EBITDA nem Núclea)"
+            cap_alertas.append("Capacidade pgto estimada via RB × 5% — preferível ter EBITDA ou Núclea")
 
     if capacidade is None:
-        cap_alertas.append("Sem dados para estimar capacidade pgto mensal — produtos 3/4/5/7 dependem de complementação")
+        cap_alertas.append("Sem dados para estimar capacidade pgto mensal — produtos baseados em capacidade serão null")
 
-    # ---- 4. Giro mensal de duplicatas (Produto 6) ----
-    # Usa Contas a Receber do balanço mais recente / 30 dias (giro mensal aproximado)
+    # ---- 6. FMM Cartão (Produto 2) ----
+    # Hierarquia: CERC > Núclea faturamento_transacional ÷ 12 > null
+    fmm_cartao  = None
+    fmm_fonte   = None
+    fmm_alertas = []
+
+    if cerc_raw:
+        historico = []
+        for item in cerc_raw.get("raw_items", []):
+            historico.extend(item.get("historico_agenda", []))
+        vals = [h["valor_liquidado"] for h in historico if h.get("valor_liquidado") is not None]
+        if vals:
+            fmm_cartao = _round(sum(vals) / len(vals), 2)
+            fmm_fonte  = "CERC (agenda 12 meses, fonte primária)"
+
+    if fmm_cartao is None and fat_trans is not None:
+        fmm_cartao = _round(fat_trans / 12, 2)
+        fmm_fonte  = "Núclea faturamento_transacional ÷ 12 (fonte secundária oficial)"
+        fmm_alertas.append("FMM via Núclea — agenda CERC requerida para confirmação definitiva")
+
+    if fmm_cartao is None:
+        fmm_alertas.append("Nem CERC nem Núclea disponíveis — Produto 2 deve ser APROVADO COM CONDIÇÕES exigindo CERC antes de calcular")
+
+    # ---- 7. Giro mensal de duplicatas (Produto 6) ----
     giro_dup = None
     giro_fonte = None
     giro_alertas = []
 
     _, bal_atual = _balanco_mais_recente(balanco)
     if bal_atual:
-        cr = _get(bal_atual, "itens", "creditos")
+        cr = bal_atual.get("creditos")
         if cr is not None:
-            # Contas a receber / 30 = giro diário; ×30 dá giro mensal... mas o pedido é "giro 30 dias"
-            # Interpretação: contas a receber representa ~30 dias de giro (PMR ≈ 17,8d na Arco-Mix, ~30d aceitável)
-            # Então giro mensal = contas a receber tal como está (representa 1 mês de fluxo)
             giro_dup = _round(cr, 2)
             giro_fonte = "Contas a Receber do balanço (proxy de giro mensal — PMR ~30 dias)"
         else:
@@ -1533,7 +1620,13 @@ def calcular_produtos_credito(
     if giro_dup is None:
         giro_alertas.append("Sem dados de duplicatas — Produto 6 depende de relatório específico de carteira")
 
-    # ---- 5. Cenários por produto ----
+    # ---- 8. Dívida bruta (do SCR) — usada em L2 do Produto 1 ----
+    divida_bruta = None
+    scr_bacen = bureaux.get("scr_bacen") or {}
+    if scr_bacen:
+        divida_bruta = scr_bacen.get("carteira_ativa")
+
+    # ---- 9. Helpers de cenários ----
 
     def cenarios_simples(
         base: float | None,
@@ -1590,17 +1683,145 @@ def calcular_produtos_credito(
             }
         return result
 
-    # Receita Bruta anualizada (base do CG Clean)
+    def cenarios_cg_clean(rb_anual: float | None, ebitda_anual_val: float | None,
+                         ebitda_mensal_val: float | None, divida: float | None) -> dict:
+        """
+        Produto 1 — CG Clean com 3 restrições (Abordagem C combinada):
+          L1 = % RB × n_efetivo                      → restrição comercial
+          L2 = MAX(0, Teto × EBITDA - Dívida)        → cap de alavancagem
+          L3 = % DSCR × EBITDA_mensal × 24m          → restrição de cobertura
+
+          Limite_Final = MIN(L1, L2, L3)
+
+        Se EBITDA é null/negativo → todos cenários null (CG Clean não pode ser oferecido).
+        """
+        if rb_anual is None or ebitda_anual_val is None or ebitda_mensal_val is None:
+            return {r: None for r in _N_RATING}
+
+        result = {}
+        for rating in _N_RATING:
+            n_ef = n_efetivos[rating]
+
+            # L1 — restrição comercial
+            l1 = _round(_PCT_CG_CLEAN[rating] * rb_anual * n_ef, 2)
+
+            # L2 — cap de alavancagem (capacidade adicional além da dívida atual)
+            teto = _TETO_DIVIDA_EBITDA[rating]
+            divida_max_permitida = teto * ebitda_anual_val
+            l2_raw = divida_max_permitida - (divida or 0)
+            l2 = _round(max(0, l2_raw), 2)
+
+            # L3 — cobertura DSCR (parcela mensal sobre EBITDA mensal)
+            pct_dscr = _PCT_DSCR[rating]
+            parcela_max = pct_dscr * ebitda_mensal_val
+            l3 = _round(parcela_max * 24, 2)  # 24 meses de prazo
+
+            # Limite final = MIN dos 3
+            limite_final = _round(min(l1, l2, l3), 2)
+            restricao_ativa = (
+                "L1" if l1 <= l2 and l1 <= l3 else
+                "L2" if l2 <= l1 and l2 <= l3 else
+                "L3"
+            )
+
+            parcela = _round(limite_final / 24, 2) if limite_final > 0 else 0
+            pct_parcela_ebitda_mensal = _div(parcela, ebitda_mensal_val, 4)
+
+            result[rating] = {
+                "n_rating":          _N_RATING[rating],
+                "n_efetivo":         _round(n_ef, 4),
+                "L1_comercial":      l1,
+                "L1_formula":        f"{_PCT_CG_CLEAN[rating]*100:.0f}% × RB × n_efetivo",
+                "L2_alavancagem":    l2,
+                "L2_formula":        f"MAX(0, {teto}x × EBITDA - Dívida_Bruta)",
+                "L2_teto_divida":    teto,
+                "L3_dscr":           l3,
+                "L3_formula":        f"{pct_dscr*100:.0f}% × EBITDA_mensal × 24m",
+                "limite_bruto":      l1,            # mantém L1 como "bruto" pra comparação
+                "limite_final":      limite_final,
+                "restricao_ativa":   restricao_ativa,
+                "parcela_mensal":    parcela,
+                "pct_parcela_ebitda_mensal": pct_parcela_ebitda_mensal,
+                "cap_aplicado":      restricao_ativa in ("L2", "L3"),
+            }
+        return result
+
+    def cenarios_com_dscr(
+        base: float | None,
+        ebitda_mensal_val: float | None,
+        pct_por_rating: dict[str, float],
+        prazo_meses: int,
+    ) -> dict:
+        """
+        Produtos 3, 4, 5, 7 — fórmula L1 ∩ L2:
+          L1 = % × base × n_efetivo                      → restrição comercial
+          L2 = % DSCR × EBITDA_mensal × prazo            → cobertura
+
+        Para Produto 7 (Convênio), base = Núclea MIN; EBITDA é usado apenas em L2.
+        Se EBITDA mensal é null, L2 não aplica e Limite_Final = L1.
+        """
+        if base is None:
+            return {r: None for r in _N_RATING}
+
+        result = {}
+        for rating in _N_RATING:
+            n_ef = n_efetivos[rating]
+            pct  = pct_por_rating[rating]
+
+            # L1 — restrição comercial
+            l1 = _round(pct * base * n_ef, 2)
+
+            # L2 — cobertura DSCR (só se EBITDA disponível)
+            if ebitda_mensal_val is not None:
+                pct_dscr = _PCT_DSCR[rating]
+                l2 = _round(pct_dscr * ebitda_mensal_val * prazo_meses, 2)
+                limite_final = _round(min(l1, l2), 2)
+                restricao_ativa = "L1" if l1 <= l2 else "L2"
+            else:
+                l2 = None
+                limite_final = l1
+                restricao_ativa = "L1 (L2 não calculável — sem EBITDA)"
+
+            parcela = _round(limite_final / prazo_meses, 2) if limite_final > 0 else 0
+
+            result[rating] = {
+                "n_rating":          _N_RATING[rating],
+                "n_efetivo":         _round(n_ef, 4),
+                "pct_base":          pct,
+                "L1_comercial":      l1,
+                "L1_formula":        f"{pct*100:.0f}% × base × n_efetivo",
+                "L2_dscr":           l2,
+                "L2_formula":        f"{_PCT_DSCR[rating]*100:.0f}% × EBITDA_mensal × {prazo_meses}m" if l2 is not None else None,
+                "limite_bruto":      l1,
+                "limite_final":      limite_final,
+                "restricao_ativa":   restricao_ativa,
+                "parcela_mensal":    parcela,
+                "cap_aplicado":      restricao_ativa.startswith("L2"),
+            }
+        return result
+
+    # Receita Bruta anualizada (base do CG Clean L1)
     rb_anual = _anualizar_campo(p2.get("dre", []), "receita_bruta")
 
     cenarios = {
-        "cg_clean":                   cenarios_simples(rb_anual,   _PCT_CG_CLEAN,    cap=None, prazo_meses=24),
+        # Produto 1 — CG Clean com L1+L2+L3
+        "cg_clean":                   cenarios_cg_clean(rb_anual, ebitda_anual, ebitda_mensal, divida_bruta),
+
+        # Produto 2 — CG Cartão (não muda)
         "cg_cessao_fid_cartao":       cenarios_cg_cartao(fmm_cartao),
-        "antecipacao_risco_sacado":   cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
-        "antecipacao_risco_cedente":  cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
-        "antecipacao_nao_performado": cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=12),
+
+        # Produtos 3, 4 — Antecipação Sacado/Cedente: base EBITDA anual, com cap DSCR
+        "antecipacao_risco_sacado":   cenarios_com_dscr(ebitda_anual, ebitda_mensal, _PCT_ANTECIPACAO, prazo_meses=8),
+        "antecipacao_risco_cedente":  cenarios_com_dscr(ebitda_anual, ebitda_mensal, _PCT_ANTECIPACAO, prazo_meses=8),
+
+        # Produto 5 — Não Performado: base EBITDA anual, % menor, com cap DSCR (prazo 12m)
+        "antecipacao_nao_performado": cenarios_com_dscr(ebitda_anual, ebitda_mensal, _PCT_NAO_PERFORMADO, prazo_meses=12),
+
+        # Produto 6 — Duplicatas: base Contas a Receber (sem DSCR — recebível é a garantia)
         "cg_cessao_fid_duplicatas":   cenarios_simples(giro_dup,   _PCT_DUPLICATAS,  cap=None, prazo_meses=12),
-        "convenio_risco_sacado":      cenarios_simples(capacidade, _PCT_ANTECIPACAO, cap=None, prazo_meses=8),
+
+        # Produto 7 — Convênio Sacado: base Núclea MIN, com cap DSCR
+        "convenio_risco_sacado":      cenarios_com_dscr(nuclea_cap_min, ebitda_mensal, _PCT_CONVENIO, prazo_meses=8),
     }
 
     return {
@@ -1609,16 +1830,36 @@ def calcular_produtos_credito(
             "fonte":   fmm_fonte,
             "alertas": fmm_alertas,
         },
+        "ebitda_anual": {
+            "valor":   ebitda_anual,
+            "fonte":   "DRE: período mais recente anualizado (com hierarquia EBIT + Depreciação)",
+            "alertas": ebitda_alertas,
+        },
+        "ebitda_mensal": {
+            "valor":   ebitda_mensal,
+            "fonte":   "EBITDA anual ÷ 12",
+        },
         "capacidade_pgto_mensal": {
             "valor":   capacidade,
             "fonte":   cap_fonte,
             "alertas": cap_alertas,
+            "hierarquia_usada": [
+                "1º EBITDA mensal (geração operacional)",
+                "2º Núclea MIN(recebimentos, pagamentos)/12 (fallback)",
+                "3º Receita Bruta × 5% / 12 (último fallback)",
+            ],
+        },
+        "nuclea_capacidade_min": {
+            "valor":   nuclea_cap_min,
+            "fonte":   nuclea_cap_fonte,
+            "alertas": nuclea_alertas,
         },
         "giro_duplicatas_mensal": {
             "valor":   giro_dup,
             "fonte":   giro_fonte,
             "alertas": giro_alertas,
         },
+        "divida_bruta_scr": divida_bruta,
         "receita_bruta_anual": rb_anual,
         "ajustes_comuns": {
             "anos_operacao":         anos_op,
@@ -1632,12 +1873,16 @@ def calcular_produtos_credito(
             "cg_cessao_fid_cartao": _CAP_CARTAO,
             "demais_produtos":      None,
         },
-        "tabela_n_rating": _N_RATING,
-        "cenarios_por_produto": cenarios,
+        "tabela_n_rating":            _N_RATING,
+        "tabela_teto_divida_ebitda":  _TETO_DIVIDA_EBITDA,
+        "tabela_pct_dscr":            _PCT_DSCR,
+        "cenarios_por_produto":       cenarios,
         "nota_uso": (
             "O E4 escolhe o rating Izi (AA-E) baseado em análise qualitativa "
             "(liquidez, alavancagem, scores, prejuízo). Após escolher rating, "
-            "lê limite_final do cenário correspondente. Sem haircuts adicionais."
+            "lê limite_final do cenário correspondente. Sem haircuts adicionais. "
+            "Produto 1 (CG Clean) aplica MIN(L1=%RB, L2=teto alavancagem, L3=DSCR). "
+            "Produtos 3, 4, 5, 7 aplicam MIN(L1, L2 DSCR)."
         ),
     }
 
