@@ -1156,6 +1156,12 @@ def calcular_transacional_nuclea(nuclea: dict | None, dre: list[dict]) -> dict |
     Fórmulas:
       pagamentos_receita              = Valores Pagos / Receita Líquida anualizada
       faturamento_transacional_receita = Faturamento Transacional / Receita Líquida anualizada
+
+    Validações de robustez (Núclea é doc gráfico — OCR instável):
+      - Reconstrói faturamento_transacional pela soma cartão+boleto+TED se vier null.
+      - Valida score numérico contra tipo_pagador textual (mais confiável).
+        Núclea "Ótimo Pagador" → faixa ~801-1000. Score grosseiramente fora
+        (ex: 77) é flagueado como erro de OCR e anulado, mantendo o tipo_pagador.
     """
     if not nuclea:
         return None
@@ -1164,21 +1170,73 @@ def calcular_transacional_nuclea(nuclea: dict | None, dre: list[dict]) -> dict |
     rl_anual = _anualizar_campo(dre, "receita_liquida")
 
     fat_trans   = nuclea.get("faturamento_transacional")
+    fat_cartao  = nuclea.get("faturamento_cartao")
+    fat_boleto  = nuclea.get("faturamento_boleto")
+    fat_ted     = nuclea.get("faturamento_ted")
     pag_total   = nuclea.get("valores_pagos")
     liq_pag     = nuclea.get("liquidez_pagamentos")
     liq_rec     = nuclea.get("liquidez_recebimento")
     conc_cli    = nuclea.get("concentracao_clientes")
     conc_forn   = nuclea.get("concentracao_fornecedores")
+    score       = nuclea.get("score")
+    tipo_pag    = nuclea.get("tipo_pagador")
+
+    alertas = []
+
+    # --- Reconstrução do transacional pela soma dos componentes (se vier null) ---
+    fat_trans_origem = "p2"
+    if fat_trans is None:
+        componentes = [v for v in (fat_cartao, fat_boleto, fat_ted) if v is not None]
+        if componentes:
+            fat_trans = _round(sum(componentes), 2)
+            fat_trans_origem = "reconstruido_soma_componentes"
+            alertas.append("faturamento_transacional reconstruído pela soma cartão+boleto+TED (valor do donut ilegível por OCR)")
+        else:
+            fat_trans_origem = "indisponivel"
+            alertas.append("faturamento_transacional indisponível: donut 'Valores Recebidos' ilegível por OCR e sem componentes para somar — reprocessar Núclea com maior DPI ou inserir manualmente")
+
+    # --- Validação score × tipo_pagador ---
+    # tipo_pagador é texto (confiável); score vem de gauge (OCR instável).
+    # Faixas Núclea (propensão de pagamento, 0-1000):
+    #   Ótimo Pagador ~801-1000 | Bom ~601-800 | Regular ~401-600 | Ruim ~201-400 | Péssimo 0-200
+    _FAIXA_TIPO = {
+        "ótimo pagador": (801, 1000), "otimo pagador": (801, 1000),
+        "bom pagador":   (601, 800),
+        "regular":       (401, 600),
+        "ruim":          (201, 400),
+        "péssimo":       (0, 200), "pessimo": (0, 200),
+    }
+    score_validado = score
+    score_origem = "p2"
+    if score is not None and tipo_pag:
+        faixa = _FAIXA_TIPO.get(tipo_pag.strip().lower())
+        if faixa and not (faixa[0] <= score <= faixa[1]):
+            # Score incoerente com a classificação textual → provável erro de OCR do gauge
+            score_validado = None
+            score_origem = "anulado_incoerente_com_tipo_pagador"
+            alertas.append(
+                f"Score Núclea {score} incoerente com tipo_pagador '{tipo_pag}' "
+                f"(faixa esperada {faixa[0]}-{faixa[1]}) — provável erro de OCR do gauge; "
+                f"score anulado. tipo_pagador '{tipo_pag}' é o dado primário confiável."
+            )
 
     return {
         "faturamento_transacional":           fat_trans,
+        "faturamento_transacional_origem":    fat_trans_origem,
+        "faturamento_cartao":                 fat_cartao,
+        "faturamento_boleto":                 fat_boleto,
+        "faturamento_ted":                    fat_ted,
         "pagamentos_total":                   pag_total,
         "liquidez_pagamento":                 liq_pag,
         "liquidez_recebimento":               liq_rec,
         "concentracao_clientes":              conc_cli,
         "concentracao_fornecedores":          conc_forn,
+        "score":                              score_validado,
+        "score_origem":                       score_origem,
+        "tipo_pagador":                       tipo_pag,
         "pagamentos_receita":                 _div(pag_total, rl_anual),
         "faturamento_transacional_receita":   _div(fat_trans, rl_anual),
+        "alertas":                            alertas,
         # fórmulas
         "pagamentos_receita_formula":               "Valores Pagos (Nuclea) / Receita Líquida anualizada",
         "faturamento_transacional_receita_formula": "Faturamento Transacional (Nuclea) / Receita Líquida anualizada",
