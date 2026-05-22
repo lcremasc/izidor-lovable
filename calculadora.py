@@ -1510,7 +1510,9 @@ def calcular_produtos_credito(
     n_efetivos = _cenarios_n_efetivo(ajuste_id, ajuste_ten)
 
     # ---- 2. FMM Cartão (Produto 2) ----
-    # Hierarquia: CERC > Núclea total transacional > null
+    # Hierarquia: CERC > Núclea faturamento_cartao > Núclea faturamento_transacional > null
+    # FMM = Faturamento Mensal Médio de CARTÃO. Usar faturamento_cartao (só cartão),
+    # não faturamento_transacional (que soma cartão + boleto + TED).
     fmm_cartao  = None
     fmm_fonte   = None
     fmm_alertas = []
@@ -1526,11 +1528,19 @@ def calcular_produtos_credito(
             fmm_fonte  = "CERC (agenda 12 meses, fonte primária)"
 
     if fmm_cartao is None:
+        fat_cartao = nuclea.get("faturamento_cartao")
+        if fat_cartao is not None:
+            fmm_cartao = _round(fat_cartao / 12, 2)
+            fmm_fonte  = "Núclea faturamento_cartao ÷ 12 (fonte secundária oficial — só cartão)"
+            fmm_alertas.append("FMM via Núclea faturamento_cartao — agenda CERC requerida para confirmação definitiva")
+
+    if fmm_cartao is None:
+        # Último fallback: transacional (inclui boleto/TED — superestima o cartão)
         fat_trans = nuclea.get("faturamento_transacional")
         if fat_trans is not None:
             fmm_cartao = _round(fat_trans / 12, 2)
-            fmm_fonte  = "Núclea faturamento_transacional ÷ 12 (fonte secundária oficial)"
-            fmm_alertas.append("FMM via Núclea — agenda CERC requerida para confirmação definitiva")
+            fmm_fonte  = "Núclea faturamento_transacional ÷ 12 (fallback — inclui boleto/TED, pode superestimar cartão)"
+            fmm_alertas.append("FMM via faturamento_transacional (cartão+boleto+TED) — faturamento_cartao ausente; valor pode estar superestimado")
 
     if fmm_cartao is None:
         fmm_alertas.append("Nem CERC nem Núclea disponíveis — Produto 2 deve ser APROVADO COM CONDIÇÕES exigindo CERC antes de calcular")
@@ -1599,29 +1609,6 @@ def calcular_produtos_credito(
 
     if capacidade is None:
         cap_alertas.append("Sem dados para estimar capacidade pgto mensal — produtos baseados em capacidade serão null")
-
-    # ---- 6. FMM Cartão (Produto 2) ----
-    # Hierarquia: CERC > Núclea faturamento_transacional ÷ 12 > null
-    fmm_cartao  = None
-    fmm_fonte   = None
-    fmm_alertas = []
-
-    if cerc_raw:
-        historico = []
-        for item in cerc_raw.get("raw_items", []):
-            historico.extend(item.get("historico_agenda", []))
-        vals = [h["valor_liquidado"] for h in historico if h.get("valor_liquidado") is not None]
-        if vals:
-            fmm_cartao = _round(sum(vals) / len(vals), 2)
-            fmm_fonte  = "CERC (agenda 12 meses, fonte primária)"
-
-    if fmm_cartao is None and fat_trans is not None:
-        fmm_cartao = _round(fat_trans / 12, 2)
-        fmm_fonte  = "Núclea faturamento_transacional ÷ 12 (fonte secundária oficial)"
-        fmm_alertas.append("FMM via Núclea — agenda CERC requerida para confirmação definitiva")
-
-    if fmm_cartao is None:
-        fmm_alertas.append("Nem CERC nem Núclea disponíveis — Produto 2 deve ser APROVADO COM CONDIÇÕES exigindo CERC antes de calcular")
 
     # ---- 7. Giro mensal de duplicatas (Produto 6) ----
     giro_dup = None
