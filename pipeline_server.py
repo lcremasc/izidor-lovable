@@ -350,20 +350,20 @@ def _preparar_documentos(docs_dir: Path) -> Path:
 
     # Comprimir PDFs grandes
     print("   🗜️  Verificando PDFs...")
-    # Documentos majoritariamente gráficos (Núclea: gauge + donuts) perdem
-    # legibilidade dos números com compressão agressiva. Detectados pelo nome,
-    # são copiados sem compressão de tela (ou com compressão leve) para preservar
-    # a leitura de score e faturamento transacional.
-    _GRAFICOS_SENSIVEIS = ("nuclea", "cip", "05677591-05")
+    # Documentos escaneados/gráficos perdem legibilidade de números com compressão
+    # agressiva (ex: '8' vira '2' no score). Detectados pelo nome, são copiados sem
+    # compressão de tela para preservar leitura de scores, gauges, donuts e tabelas.
+    # Cobre: Núclea (gauge+donuts), Serasa/Quod (scores escaneados), faturamento (OCR).
+    _OCR_SENSIVEIS = ("nuclea", "cip", "05677591-05", "serasa", "quod", "faturamento")
     for pdf in sorted(docs_dir.glob("*.pdf")):
         kb = pdf.stat().st_size / 1024
         dst = comp_dir / pdf.name
         nome_lower = pdf.name.lower()
-        eh_grafico = any(tag in nome_lower for tag in _GRAFICOS_SENSIVEIS)
+        eh_ocr_sensivel = any(tag in nome_lower for tag in _OCR_SENSIVEIS)
 
-        if eh_grafico:
-            # Não comprimir com perda — preserva legibilidade de gauge/donut.
-            print(f"   🖼️  {pdf.name} ({kb:.0f} KB) → documento gráfico (Núclea), preservado sem compressão de tela")
+        if eh_ocr_sensivel:
+            # Não comprimir com perda — preserva legibilidade de scores/gauges/tabelas.
+            print(f"   🖼️  {pdf.name} ({kb:.0f} KB) → documento OCR-sensível (bureau/gráfico/faturamento), preservado sem compressão de tela")
             shutil.copy2(pdf, dst)
         elif kb > LIMITE_KB_PDF:
             print(f"   🔧 {pdf.name} ({kb:.0f} KB) → comprimindo...")
@@ -665,7 +665,7 @@ async def _rodar_pipeline(analysis_id: str) -> None:
 
         # Buscar prompts do Supabase
         p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v6.0&select=content")
-        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8.6&select=content")
+        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8.7&select=content")
         p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v2.7&select=content")
 
         if not p_e1_rows or not p_e2_rows or not p_e4_rows:
