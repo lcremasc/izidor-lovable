@@ -648,9 +648,9 @@ async def _rodar_pipeline(analysis_id: str) -> None:
         )
 
         # Buscar prompts do Supabase
-        p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v5&select=content")
-        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v7&select=content")
-        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v1&select=content")
+        p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v6.0&select=content")
+        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8.6&select=content")
+        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v2.7&select=content")
 
         if not p_e1_rows or not p_e2_rows or not p_e4_rows:
             raise RuntimeError("Um ou mais prompts não encontrados na tabela 'prompts'")
