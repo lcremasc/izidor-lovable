@@ -1275,6 +1275,37 @@ def calcular_restritivos_bureau(serasa: dict | None, quod: dict | None = None) -
         "quod_inadimplencia":         quod.get("inadimplencia")         if quod else None,
         "quod_faturamento_presumido": quod.get("faturamento_presumido") if quod else None,
     }
+
+    # ── Rede de segurança: coerência do score Serasa (anti-erro de OCR) ──
+    # O score Serasa vem de dígitos sujeitos a OCR (8↔2). Se o score indicar
+    # ALTO RISCO (≤300) mas os restritivos indicarem empresa SAUDÁVEL
+    # (sem protestos, sem dívida vencida, sem falência/RJ, PEFIN/REFIN baixos),
+    # há forte chance de o número ter sido mal lido. Flag para revisão.
+    s_score = resultado["serasa_score"]
+    if s_score is not None and s_score <= 300:
+        pefin   = resultado["pefin_valor"] or 0
+        refin   = resultado["refin_valor"] or 0
+        div_v   = resultado["divida_vencida_valor"] or 0
+        prot    = resultado["protestos_valor"] or 0
+        falen   = resultado["falencia_valor"] or 0
+        recup   = resultado["recuperacao_judicial_valor"] or 0
+        # "Saudável" = sem eventos graves e restritivos imateriais
+        saudavel = (prot == 0 and div_v == 0 and falen == 0 and recup == 0
+                    and pefin < 50_000 and refin < 50_000)
+        if saudavel:
+            resultado["serasa_score_alerta"] = (
+                f"ALERTA OCR — score Serasa lido como {s_score} (faixa de risco ALTO), "
+                f"mas restritivos indicam empresa saudável (sem protestos/dívida vencida/falência; "
+                f"PEFIN R$ {pefin:,.0f}, REFIN R$ {refin:,.0f}). O número provavelmente foi mal lido "
+                f"(dígito inicial: ex. 8→2 transformaria 826 em 226). Confirmar score no documento original; "
+                f"não usar {s_score} como definitivo."
+            )
+            resultado["serasa_score_suspeito"] = True
+        else:
+            resultado["serasa_score_suspeito"] = False
+    else:
+        resultado["serasa_score_suspeito"] = False
+
     return resultado
 
 
