@@ -231,7 +231,9 @@ def _comprimir_pdf(src: Path, dst: Path) -> Path:
         doc = fitz.open(str(src))
         doc_novo = fitz.open()
         for page in doc:
-            mat = fitz.Matrix(100 / 72, 100 / 72)
+            # 150 DPI (era 100): melhora legibilidade de gauges/donuts (ex: Núclea)
+            # sem inflar demais o arquivo. Gráficos densos a 100 DPI saem borrados.
+            mat = fitz.Matrix(150 / 72, 150 / 72)
             pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
             img_page = fitz.open()
             img_page.new_page(width=pix.width, height=pix.height)
@@ -267,7 +269,9 @@ def _ocr_pdf(src: Path) -> bool:
             proporcao_valida = chars_validos / max(len(texto), 1)
 
             if len(texto) < 50 or proporcao_valida < 0.7:
-                mat = fitz.Matrix(200 / 72, 200 / 72)
+                # 300 DPI (era 200): números dentro de gráficos (gauge/donut da Núclea)
+                # precisam de alta resolução para o OCR ler corretamente.
+                mat = fitz.Matrix(300 / 72, 300 / 72)
                 pix = page.get_pixmap(matrix=mat)
                 img_bytes = pix.tobytes("png")
                 img = Image.open(io.BytesIO(img_bytes))
@@ -346,10 +350,22 @@ def _preparar_documentos(docs_dir: Path) -> Path:
 
     # Comprimir PDFs grandes
     print("   🗜️  Verificando PDFs...")
+    # Documentos majoritariamente gráficos (Núclea: gauge + donuts) perdem
+    # legibilidade dos números com compressão agressiva. Detectados pelo nome,
+    # são copiados sem compressão de tela (ou com compressão leve) para preservar
+    # a leitura de score e faturamento transacional.
+    _GRAFICOS_SENSIVEIS = ("nuclea", "cip", "05677591-05")
     for pdf in sorted(docs_dir.glob("*.pdf")):
         kb = pdf.stat().st_size / 1024
         dst = comp_dir / pdf.name
-        if kb > LIMITE_KB_PDF:
+        nome_lower = pdf.name.lower()
+        eh_grafico = any(tag in nome_lower for tag in _GRAFICOS_SENSIVEIS)
+
+        if eh_grafico:
+            # Não comprimir com perda — preserva legibilidade de gauge/donut.
+            print(f"   🖼️  {pdf.name} ({kb:.0f} KB) → documento gráfico (Núclea), preservado sem compressão de tela")
+            shutil.copy2(pdf, dst)
+        elif kb > LIMITE_KB_PDF:
             print(f"   🔧 {pdf.name} ({kb:.0f} KB) → comprimindo...")
             _comprimir_pdf(pdf, dst)
             if dst.exists():
@@ -648,9 +664,9 @@ async def _rodar_pipeline(analysis_id: str) -> None:
         )
 
         # Buscar prompts do Supabase
-        p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v6.0&select=content")
-        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8.6&select=content")
-        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v2.7&select=content")
+        p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v5&select=content")
+        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v7&select=content")
+        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v1&select=content")
 
         if not p_e1_rows or not p_e2_rows or not p_e4_rows:
             raise RuntimeError("Um ou mais prompts não encontrados na tabela 'prompts'")
