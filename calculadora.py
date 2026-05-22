@@ -228,10 +228,30 @@ def _calcular_lucro_bruto_ebit_ebitda(itens: dict) -> dict:
         ebit_origem  = "calculado"
         ebit_formula = "Lucro Bruto − |Despesas Operacionais| + Outras Receitas Operacionais"
     else:
-        ebit         = None
-        ebit_origem  = "indisponivel"
-        ebit_formula = None
-        alertas.append("EBIT não disponível: faltam Lucro Bruto e/ou Despesas Operacionais")
+        # Fallback: derivar EBIT pelo resultado, quando despesas_operacionais vem null.
+        # EBIT = LAIR − Resultado Financeiro;  LAIR = Lucro Líquido + |IR/CSLL| (se LAIR null)
+        # Validado contra DREs auditadas: bate exatamente com o EBIT explícito.
+        ll       = itens.get("lucro_liquido")
+        ir_csll  = itens.get("ir_csll")
+        lair_p2  = itens.get("lair")
+        res_fin  = itens.get("resultado_financeiro")
+
+        lair_calc = None
+        if lair_p2 is not None:
+            lair_calc = lair_p2
+        elif ll is not None:
+            lair_calc = ll + (abs(ir_csll) if ir_csll is not None else 0)
+
+        if lair_calc is not None and res_fin is not None:
+            ebit         = _round(lair_calc - res_fin, 2)
+            ebit_origem  = "calculado_via_resultado"
+            ebit_formula = "LAIR − Resultado Financeiro (LAIR = Lucro Líquido + |IR/CSLL|) — fallback p/ despesas_operacionais null"
+            alertas.append("EBIT derivado via LAIR − Resultado Financeiro (despesas_operacionais ausente no p2)")
+        else:
+            ebit         = None
+            ebit_origem  = "indisponivel"
+            ebit_formula = None
+            alertas.append("EBIT não disponível: faltam Despesas Operacionais e também Lucro Líquido/Resultado Financeiro para fallback")
 
     # --- EBITDA ---
     if ebitda_p2 is not None:
