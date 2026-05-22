@@ -46,15 +46,15 @@ STORAGE_BUCKET        = "analysis-files"
 API_URL               = "https://api.anthropic.com/v1/messages"
 
 MODELO_E1             = "claude-haiku-4-5-20251001"
-MODELO_E2             = "claude-sonnet-4-6"
-MODELO_E4             = "claude-sonnet-4-6"
+MODELO_E2             = "claude-sonnet-4-6"  # ← MUDANÇA: era haiku-4-5. Confirma string exata em docs.claude.com
+MODELO_E4             = "claude-sonnet-4-6"  # ← MUDANÇA: era sonnet-4-20250514 (Sonnet 4 antigo de maio/24). Confirma string exata
 
 MAX_TOKENS_E1         = 8_000
-MAX_TOKENS_E2         = 32_000
-MAX_TOKENS_E4         = 32_000
+MAX_TOKENS_E2         = 32_000   # Era 16K — Sonnet 4.6 gera output mais denso na extração
+MAX_TOKENS_E4         = 32_000   # Memorando completo. Sonnet 4.6 suporta até 128K, mas mais tokens = mais tempo de geração
 CHUNK_DOCS            = 1         # 1 doc por vez — seguro para PDFs grandes
 SLEEP_ENTRE_LOTES     = 30        # segundos entre lotes
-TIMEOUT               = 300       # segundos por chamada à API Anthropic
+TIMEOUT               = 900       # segundos por chamada (15 min). Sonnet 4.6: TTFT ~110s + ~61 tok/s → 32K tokens pode levar ~10min
 LIMITE_KB_PDF         = 800       # PDFs maiores que isso são comprimidos
 
 app = FastAPI(title="Pipeline de Análise de Crédito")
@@ -118,8 +118,20 @@ def _juntar_texto(content: list) -> str:
     return "\n".join(b["text"] for b in content if b.get("type") == "text")
 
 
-def _extrair_json(texto: str) -> dict:
-    """Extrai o primeiro JSON válido — lógica idêntica ao pipeline original."""
+def _extrair_json(texto: str, stop_reason: str | None = None) -> dict:
+    """Extrai o primeiro JSON válido — lógica idêntica ao pipeline original.
+
+    Se stop_reason == 'max_tokens', a resposta foi truncada pelo limite de output;
+    levanta erro explícito recomendando aumentar max_tokens.
+    """
+    if stop_reason == "max_tokens":
+        raise ValueError(
+            f"E4 TRUNCADO: a resposta atingiu o limite de max_tokens (stop_reason=max_tokens). "
+            f"Gerou {len(texto)} chars mas o JSON não fechou. "
+            f"AÇÃO: aumente MAX_TOKENS_E4 ou reduza o tamanho do memorando no PROMPT_04. "
+            f"Últimos 300 chars: {texto[-300:]}"
+        )
+
     for tentativa in [
         lambda t: json.loads(t.strip()),
         lambda t: json.loads(re.sub(r"```(?:json)?\s*|```\s*$", "", t, flags=re.M).strip()),
@@ -130,7 +142,7 @@ def _extrair_json(texto: str) -> dict:
             pass
     ini, prof = texto.find("{"), 0
     if ini == -1:
-        raise ValueError("Nenhum JSON encontrado na resposta")
+        raise ValueError(f"Nenhum JSON encontrado na resposta. Primeiros 300 chars: {texto[:300]}")
     for i, c in enumerate(texto[ini:], ini):
         prof += (c == "{") - (c == "}")
         if prof == 0:
@@ -179,7 +191,7 @@ async def _chamar_api(
                 uso_total[k] += data.get("usage", {}).get(k, 0)
 
             if data.get("stop_reason") != "tool_use":
-                return _juntar_texto(data.get("content", [])), uso_total
+                return _juntar_texto(data.get("content", [])), uso_total, data.get("stop_reason")
 
             # Loop tool_use — idêntico ao original
             tool_results = []
@@ -637,8 +649,8 @@ async def _rodar_pipeline(analysis_id: str) -> None:
 
         # Buscar prompts do Supabase
         p_e1_rows = await _sb_get("prompts", "name=eq.PROMPT_00_PESQUISA_v5&select=content")
-        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v8&select=content")
-        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v2&select=content")
+        p_e2_rows = await _sb_get("prompts", "name=eq.PROMPT_01_EXTRACAO_v7&select=content")
+        p_e4_rows = await _sb_get("prompts", "name=eq.PROMPT_04_MEMORANDO_v1&select=content")
 
         if not p_e1_rows or not p_e2_rows or not p_e4_rows:
             raise RuntimeError("Um ou mais prompts não encontrados na tabela 'prompts'")
@@ -677,7 +689,7 @@ async def _rodar_pipeline(analysis_id: str) -> None:
                 }],
             }]
 
-            texto_e1, uso_e1 = await _chamar_api(
+            texto_e1, uso_e1, _ = await _chamar_api(
                 mensagens=mensagem_e1,
                 max_tokens=MAX_TOKENS_E1,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
@@ -740,13 +752,13 @@ async def _rodar_pipeline(analysis_id: str) -> None:
                     },
                 ]
 
-                texto_e2, uso_lote = await _chamar_api(
+                texto_e2, uso_lote, stop_e2 = await _chamar_api(
                     mensagens=[{"role": "user", "content": content}],
                     max_tokens=MAX_TOKENS_E2,
                     cache=True,
                     modelo=MODELO_E2,
                 )
-                p2_parciais.append(_extrair_json(texto_e2))
+                p2_parciais.append(_extrair_json(texto_e2, stop_reason=stop_e2))
                 for k in uso_e2_total:
                     uso_e2_total[k] += uso_lote.get(k, 0)
                 print(f"   ✅ Lote {n} OK — out: {uso_lote['output_tokens']:,} tokens")
@@ -817,14 +829,14 @@ async def _rodar_pipeline(analysis_id: str) -> None:
             }],
         }]
 
-        texto_e4, uso_e4 = await _chamar_api(
+        texto_e4, uso_e4, stop_e4 = await _chamar_api(
             mensagens=mensagem_e4,
             max_tokens=MAX_TOKENS_E4,
             cache=True,
             modelo=MODELO_E4,
         )
 
-        p4 = _extrair_json(texto_e4)
+        p4 = _extrair_json(texto_e4, stop_reason=stop_e4)
         print(f"✅ E4 concluído em {time.monotonic()-t0:.1f}s")
         await _sb_patch("analyses", analysis_id, {"p4": p4})
 
@@ -867,14 +879,26 @@ async def _rodar_pipeline(analysis_id: str) -> None:
         print(f"\n✅ Pipeline concluído — analysis_id: {analysis_id}")
 
     except Exception as exc:
-        print(f"\n❌ Erro no pipeline: {exc}")
+        import traceback
+        tb = traceback.format_exc()
+        # Mensagem rica: tipo + mensagem + etapa inferida + traceback resumido
+        msg_erro = f"{type(exc).__name__}: {exc}"
+        print(f"\n❌ Erro no pipeline: {msg_erro}")
+        print(tb)
+        # Tenta salvar com status + error_message. Se a coluna error_message não existir,
+        # tenta de novo só com status para ao menos marcar o erro.
         try:
             await _sb_patch("analyses", analysis_id, {
                 "status": "error",
-                "error_message": str(exc)[:2000],
+                "error_message": (msg_erro + "\n\n" + tb)[:2000],
             })
         except Exception as patch_exc:
-            print(f"   ⚠️  Não foi possível salvar erro no Supabase: {patch_exc}")
+            print(f"   ⚠️  PATCH com error_message falhou: {patch_exc}")
+            try:
+                await _sb_patch("analyses", analysis_id, {"status": "error"})
+                print("   ℹ️  Status 'error' salvo, mas error_message não (verifique se a coluna existe na tabela)")
+            except Exception as patch_exc2:
+                print(f"   ⚠️  PATCH só com status também falhou: {patch_exc2}")
         raise
 
 
