@@ -402,7 +402,7 @@ def _preparar_documentos(docs_dir: Path) -> Path:
 # CARREGAMENTO DE DOCUMENTOS  (idêntico ao original)
 # ══════════════════════════════════════════════════════════════════════════════
 
-EXTENSOES_SUPORTADAS = {".pdf", ".png", ".jpg", ".jpeg", ".xlsx", ".txt"}
+EXTENSOES_SUPORTADAS = {".pdf", ".png", ".jpg", ".jpeg", ".xlsx", ".txt", ".csv", ".html"}
 MIME = {
     ".pdf":  "application/pdf",
     ".png":  "image/png",
@@ -410,6 +410,8 @@ MIME = {
     ".jpeg": "image/jpeg",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".txt":  "text/plain",
+    ".csv":  "text/csv",
+    ".html": "text/html",
 }
 PRIORIDADE = [
     ["scr", "bacen"],
@@ -417,6 +419,7 @@ PRIORIDADE = [
     ["quod"],
     ["nuclea", "cip"],
     ["cerc", "agenda"],
+    ["radar", "recebiveis", "recebíveis"],
     ["painel", "gestao", "gerencial", "consolidado"],
     ["balanco", "balanço", "balancete"],
     ["dre", "resultado"],
@@ -432,10 +435,60 @@ def _prioridade_doc(nome: str) -> int:
     return len(PRIORIDADE)
 
 
+def _blocos_recebiveis(docs_dir: Path) -> tuple[list[dict], set[str]]:
+    """
+    NOVO (v8.9): parseia deterministicamente as 3 fontes de recebíveis de cartão
+    (Radar / Agenda CERC AP005 / Raio-X) e devolve blocos JSON AUTORITATIVOS +
+    o conjunto de nomes de arquivo já consumidos (que NÃO devem ser reenviados crus).
+    Raio-X e Agenda AP005 são fontes SEPARADAS — cada uma vira um bloco distinto.
+    """
+    from parsers_recebiveis import parse_radar, parse_agenda_ap005, parse_raiox_html
+
+    blocos: list[dict] = []
+    consumidos: set[str] = set()
+    arqs = [f for f in docs_dir.iterdir() if f.is_file()]
+
+    radar  = [f for f in arqs if "radar" in f.name.lower() and f.suffix.lower() == ".csv"]
+    agenda = [f for f in arqs if "ret_agenda_nova" in f.name.lower() and f.suffix.lower() == ".csv"]
+    raiox  = [f for f in arqs if "raio_x" in f.name.lower() and f.suffix.lower() == ".html"]
+
+    def _add(titulo: str, dado: dict, fontes: list[Path]) -> None:
+        blocos.append({
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain",
+                       "data": json.dumps(dado, ensure_ascii=False)},
+            "title": titulo,
+        })
+        consumidos.update(f.name for f in fontes)
+        print(f"   ✅ {titulo} injetado (autoritativo) — {len(fontes)} arquivo(s) consumido(s)")
+
+    if radar:
+        _add("RADAR_PARSEADO.json", parse_radar(str(radar[0])), radar)
+    if agenda:
+        # Agenda: extração COMPLETA persistida (df_ur + df_pg) + digest agregado no bloco da API.
+        from ler_agenda_completa import processar_agenda
+        digest, df_ur, df_pg = processar_agenda([str(f) for f in agenda])
+        try:
+            saida = Path("/mnt/user-data/outputs")
+            saida.mkdir(parents=True, exist_ok=True)
+            df_ur.drop(columns=["lista_informacoes_pagamento"], errors="ignore").to_csv(
+                saida / "agenda_ur.csv", index=False)
+            df_pg.to_csv(saida / "agenda_pagamentos.csv", index=False)
+            print(f"   💾 agenda completa persistida: {len(df_ur)} URs, {len(df_pg)} pagamentos")
+        except Exception as e:
+            print(f"   ⚠️  falha ao persistir agenda completa — {e}")
+        _add("AGENDA_AP005_PARSEADA.json", digest, agenda)
+    if raiox:
+        _add("RAIOX_PARSEADO.json", parse_raiox_html(str(raiox[0])), raiox)
+
+    return blocos, consumidos
+
+
 def _carregar_docs(docs_dir: Path) -> list[dict]:
     """
     Carrega arquivos da pasta e converte para content blocks.
-    Lógica idêntica ao pipeline original (PDF/imagem/XLSX/OCR txt).
+    Lógica idêntica ao pipeline original (PDF/imagem/XLSX/OCR txt), acrescida da
+    ingestão das fontes de recebíveis pré-parseadas (v8.9).
     """
     try:
         import openpyxl
@@ -443,12 +496,17 @@ def _carregar_docs(docs_dir: Path) -> list[dict]:
     except ImportError:
         _tem_openpyxl = False
 
+    # NOVO (v8.9): blocos autoritativos das fontes de recebíveis + arquivos crus a excluir
+    blocos_extra, consumidos = _blocos_recebiveis(docs_dir)
+
     arquivos = sorted(
-        [f for f in docs_dir.iterdir() if f.is_file() and f.suffix.lower() in EXTENSOES_SUPORTADAS],
+        [f for f in docs_dir.iterdir()
+         if f.is_file() and f.suffix.lower() in EXTENSOES_SUPORTADAS
+         and f.name not in consumidos],
         key=lambda f: (_prioridade_doc(f.name), f.name),
     )
 
-    blocks = []
+    blocks = list(blocos_extra)
     for path in arquivos:
         ext  = path.suffix.lower()
         mime = MIME.get(ext, "")
@@ -512,6 +570,20 @@ def _carregar_docs(docs_dir: Path) -> list[dict]:
                 "title": path.stem + ".pdf (OCR)",
             })
             print(f"   📝 {path.name} ({kb:.0f} KB) [OCR texto]")
+
+        elif ext in (".csv", ".html"):
+            # Fallback genérico para .csv/.html que NÃO sejam fontes de recebíveis
+            # (essas já foram consumidas por _blocos_recebiveis). Trava de contexto.
+            if kb > 500:
+                print(f"   ⚠️  {path.name} ({kb:.0f} KB) {ext} grande — ignorado no fallback genérico")
+                continue
+            texto = path.read_text(encoding="utf-8", errors="replace")
+            blocks.append({
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": texto},
+                "title": path.name,
+            })
+            print(f"   📄 {path.name} ({kb:.0f} KB) [{ext[1:].upper()}→texto]")
 
         else:
             print(f"   ⏭️  {path.name} ignorado — formato não suportado")
