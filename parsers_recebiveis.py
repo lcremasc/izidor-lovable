@@ -95,7 +95,7 @@ def parse_raiox_html(path: str) -> dict:
     disponíveis; o histograma é reconstruído da geometria SVG das barras."""
     from bs4 import BeautifulSoup
     html = open(path, encoding="utf-8", errors="replace").read()
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     txt = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     # 1) Valores EXATOS via aria-label (preferencial). Mapeia descrição → próximo valor R$.
