@@ -13,3 +13,7 @@ openpyxl==3.1.5
 
 # já incluídas no stdlib:
 # asyncio, base64, json, os, re, shutil, subprocess, tempfile, time, pathlib
+
+pandas>=2.0
+beautifulsoup4>=4.12
+openpyxl>=3.1
