@@ -1570,8 +1570,12 @@ def calcular_produtos_credito(
     # ---- 1. Inputs de fontes ----
     bureaux  = p2.get("bureaux", {}) or {}
     nuclea   = bureaux.get("nuclea") or {}
-    cerc_raw = _get(p2, "commercial_inputs", "cerc")
     balanco  = p2.get("balanco", [])
+  # DEPOIS — ler os 3 blocos v8.9 + manter cerc para retrocompat
+    cerc_raw   = _get(p2, "commercial_inputs", "cerc")              # legado v8.7
+    radar      = _get(p2, "commercial_inputs", "radar_recebiveis")  # v8.9
+    agenda_ap  = _get(p2, "commercial_inputs", "agenda_ap005")      # v8.9
+    raio_x     = _get(p2, "commercial_inputs", "raio_x")            # v8.9
 
     # Anos de operação (p1 preferencial)
     anos_op = None
