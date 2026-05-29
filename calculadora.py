@@ -2055,7 +2055,10 @@ def calcular(p2: dict, p1: dict | None = None) -> dict:
     estrutura = calcular_estrutura_capital(balanco, dre, scr_raw=scr_raw)
 
     # 11. Cartão / CERC
-    cartao = calcular_cartao_recebiveis(cerc_raw, nuclea, dre, scr_raw)
+    cartao = calcular_cartao_recebiveis(
+        cerc_raw, nuclea, dre, scr_raw,
+        radar=radar, agenda_ap=agenda_ap, raio_x=raio_x,
+    )
 
     # 12. Eficiência
     eficiencia = calcular_eficiencia(balanco, dre)
