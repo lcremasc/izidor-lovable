@@ -22,6 +22,11 @@ COPY pipeline_server.py .
 COPY calculadora.py .
 COPY montador.py .
 COPY api_client.py .
+# Item 2: parsers determinísticos de recebíveis
+COPY parsers_recebiveis.py .
+COPY ler_agenda_completa.py .
+COPY validar_recebiveis.py .
+COPY normalizacao.py .
 
 # ── Start ─────────────────────────────────────────────────────────────────
 EXPOSE 8000
