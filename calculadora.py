@@ -1022,76 +1022,133 @@ def calcular_scr(scr_raw: dict | None) -> dict:
 
 def calcular_cartao_recebiveis(
     cerc_raw: dict | None,
-    nuclea: dict | None,
-    dre: list[dict],
-    scr_raw: dict | None = None,
+    nuclea:   dict | None,
+    dre:      list[dict],
+    scr_raw:  dict | None = None,
+    *,
+    radar:     dict | None = None,
+    agenda_ap: dict | None = None,
+    raio_x:    dict | None = None,
 ) -> dict:
     """
-    Indicadores de recebíveis de cartão.
+    Indicadores de recebíveis de cartão (schema v8.9).
+
+    Lê preferencialmente dos blocos novos:
+        raio_x         — KPIs exatos (aria-label) + série mensal reconstruída do SVG
+        agenda_ap005   — agenda futura CERC AP005 (digest agregado)
+        radar_recebiveis — aging × categoria por arranjo
+    Com fallback retrocompatível ao cerc_raw legado (v8.7).
 
     Fórmulas:
-      faturamento_cartao_total   = Soma do histórico de agenda CERC (12 meses)
-      faturamento_cartao_mensal  = faturamento_cartao_total / 12
-      cartao_receita             = faturamento_cartao_total / Receita Bruta anual
-      dependencia_adquirente     = market_share do maior adquirente
-      recebiveis_cartao_divida   = faturamento_cartao_total / Dívida Bruta
-      volatilidade               = Desvio Padrão / Média (coef. de variação da agenda mensal)
+      faturamento_cartao_total           = raio_x.historico_agenda_total
+      faturamento_cartao_mensal          = raio_x.faturamento_estimado / 12
+                                           (fallback: 1º mês de agenda_ap005.agenda_por_mes)
+      cartao_receita                     = faturamento_cartao_total / Receita Líquida anualizada
+      dependencia_adquirente             = max(raio_x.market_share_adquirente)
+      volatilidade_faturamento_cartao    = stdev / mean da série mensal Agenda (raio_x)
+      crescimento_faturamento_cartao     = serie[-1] / serie[0] - 1 (YoY mês 12 / mês 0)
+      recebiveis_cartao_divida           = faturamento_cartao_total / Carteira Ativa SCR
+      agenda_futura_constituida          = agenda_ap005.totais.constituido_total
+      agenda_futura_comprometida_cessao  = agenda_ap005.comprometido.cessao_fiduciaria
+      indice_comprometimento_radar      = radar_recebiveis.totais.indice_comprometimento
     """
-    # Histórico de agenda (12 meses)
-    historico = []
-    if cerc_raw:
-        raw_items = cerc_raw.get("raw_items", [])
-        for item in raw_items:
-            historico.extend(item.get("historico_agenda", []))
+    import statistics
 
-    vals_agenda = [
-        h["valor_liquidado"] for h in historico
-        if h.get("valor_liquidado") is not None
-    ]
+    # ── 1. faturamento_cartao_total ──────────────────────────────────────
+    fat_total = (raio_x or {}).get("historico_agenda_total")
+    if fat_total is None and cerc_raw:                            # retrocompat v8.7
+        historico_legacy = []
+        for item in cerc_raw.get("raw_items", []):
+            historico_legacy.extend(item.get("historico_agenda", []))
+        vals = [h["valor_liquidado"] for h in historico_legacy
+                if h.get("valor_liquidado") is not None]
+        fat_total = sum(vals) if vals else None
 
-    fat_total  = _round(sum(vals_agenda), 2) if vals_agenda else None
-    fat_mensal = _div(fat_total, len(vals_agenda)) if vals_agenda else None
+    # ── 2. faturamento_cartao_mensal ─────────────────────────────────────
+    fat_mensal = None
+    fat_est = (raio_x or {}).get("faturamento_estimado")
+    if fat_est:
+        fat_mensal = _round(fat_est / 12, 2)
+    elif agenda_ap:                                               # fallback: 1º mês da agenda futura
+        meses_ord = sorted((agenda_ap.get("agenda_por_mes") or {}).items())
+        if meses_ord:
+            fat_mensal = _round(meses_ord[0][1].get("constituido_total"), 2)
+    if fat_mensal is None and fat_total is not None and cerc_raw: # retrocompat
+        n = sum(1 for item in cerc_raw.get("raw_items", [])
+                  for h in item.get("historico_agenda", [])
+                  if h.get("valor_liquidado") is not None)
+        if n:
+            fat_mensal = _div(fat_total, n)
 
-    # Receita Líquida anualizada do período mais recente
-    rl_anual_cart = _anualizar_campo(dre, "receita_liquida")
-
-    # Dívida bruta (para recebiveis_cartao_divida)
-    divida_bruta = scr_raw.get("carteira_ativa") if scr_raw else None
-
-    # Maior adquirente (CERC market_share_adquirente)
-    dep_adquirente = None
-    if cerc_raw:
+    # ── 3. dependencia_adquirente ────────────────────────────────────────
+    dep_adq = None
+    shares_raiox = (raio_x or {}).get("market_share_adquirente") or []
+    if shares_raiox:
+        dep_adq = max((s.get("market_share", 0) for s in shares_raiox), default=None)
+    elif cerc_raw:                                                # retrocompat
         for item in cerc_raw.get("raw_items", []):
             shares = item.get("market_share_adquirente", [])
             if shares:
-                dep_adquirente = max(s.get("market_share", 0) for s in shares)
+                dep_adq = max(s.get("market_share", 0) for s in shares)
                 break
 
-    # Volatilidade (coeficiente de variação)
+    # ── 4. volatilidade e 5. crescimento (série mensal Agenda do raio_x) ─
+    serie = [r["agenda"] for r in (raio_x or {}).get("historico_agenda_mensal") or []
+             if r.get("agenda") is not None]
     volatilidade = None
-    if len(vals_agenda) >= 2:
-        media_ag = sum(vals_agenda) / len(vals_agenda)
-        dp_ag    = statistics.stdev(vals_agenda)
-        volatilidade = _div(dp_ag, media_ag)
+    crescimento  = None
+    if len(serie) >= 2:
+        media = sum(serie) / len(serie)
+        if media:
+            volatilidade = _div(statistics.stdev(serie), media)
+    if len(serie) >= 12 and serie[0]:                             # YoY: mês 12 / mês 0
+        crescimento = _round(serie[-1] / serie[0] - 1, 4)
+    # retrocompat: histórico mensal vinha no cerc_raw legado
+    if not raio_x and cerc_raw:
+        legacy_vals = []
+        for item in cerc_raw.get("raw_items", []):
+            legacy_vals.extend([h["valor_liquidado"]
+                                for h in item.get("historico_agenda", [])
+                                if h.get("valor_liquidado") is not None])
+        if volatilidade is None and len(legacy_vals) >= 2:
+            m = sum(legacy_vals) / len(legacy_vals)
+            if m:
+                volatilidade = _div(statistics.stdev(legacy_vals), m)
+        if crescimento is None and len(legacy_vals) >= 12 and legacy_vals[0]:
+            crescimento = _round(legacy_vals[-1] / legacy_vals[0] - 1, 4)
+
+    # ── 6. derivados ─────────────────────────────────────────────────────
+    rl_anual     = _anualizar_campo(dre, "receita_liquida")
+    divida_bruta = scr_raw.get("carteira_ativa") if scr_raw else None
+
+    # ── 7. NOVOS CAMPOS v8.9 ─────────────────────────────────────────────
+    agenda_futura_const       = ((agenda_ap or {}).get("totais") or {}).get("constituido_total")
+    agenda_futura_comp_cessao = ((agenda_ap or {}).get("comprometido") or {}).get("cessao_fiduciaria")
+    idx_comprometimento       = ((radar or {}).get("totais") or {}).get("indice_comprometimento")
 
     return {
-        "faturamento_cartao_total":         fat_total,
-        "faturamento_cartao_mensal":        _round(fat_mensal, 2),
-        "cartao_receita":                   _div(fat_total, rl_anual_cart),
-        "dependencia_adquirente":           _round(dep_adquirente, 4),
-        "dependencia_bandeira":             None,  # não disponível nas fontes atuais
-        "ticket_medio_cartao":              None,  # não disponível
-        "prazo_medio_parcelamento":         None,  # não disponível
-        "recebiveis_cartao_divida":         _div(fat_total, divida_bruta),
-        "volatilidade_faturamento_cartao":  _round(volatilidade, 6),
-        "crescimento_faturamento_cartao":   None,
-        # fórmulas
-        "faturamento_cartao_total_formula":        "Soma do histórico de agenda CERC (últimos 12 meses)",
-        "faturamento_cartao_mensal_formula":       "faturamento_cartao_total / n_meses",
-        "cartao_receita_formula":                  "faturamento_cartao_total / Receita Líquida anualizada",
-        "dependencia_adquirente_formula":          "market_share do maior adquirente (CERC)",
-        "recebiveis_cartao_divida_formula":        "faturamento_cartao_total / Dívida Bruta (SCR)",
-        "volatilidade_formula":                    "Desvio Padrão / Média (coef. de variação da agenda mensal)",
+        "faturamento_cartao_total":          _round(fat_total, 2),
+        "faturamento_cartao_mensal":         fat_mensal,
+        "cartao_receita":                    _div(fat_total, rl_anual),
+        "dependencia_adquirente":            _round(dep_adq, 4),
+        "dependencia_bandeira":              None,  # sem fonte
+        "ticket_medio_cartao":               None,  # sem fonte
+        "prazo_medio_parcelamento":          None,  # sem fonte
+        "recebiveis_cartao_divida":          _div(fat_total, divida_bruta),
+        "volatilidade_faturamento_cartao":   _round(volatilidade, 6) if volatilidade is not None else None,
+        "crescimento_faturamento_cartao":    crescimento,
+        # ── NOVOS (v8.9) ──
+        "agenda_futura_constituida":         _round(agenda_futura_const, 2),
+        "agenda_futura_comprometida_cessao": _round(agenda_futura_comp_cessao, 2),
+        "indice_comprometimento_radar":      idx_comprometimento,
+        # ── Fórmulas ──
+        "faturamento_cartao_total_formula":  "raio_x.historico_agenda_total (aria-label exato) | fallback: soma legacy do histórico CERC",
+        "faturamento_cartao_mensal_formula": "raio_x.faturamento_estimado / 12 | fallback: agenda_ap005 1º mês constituído",
+        "cartao_receita_formula":            "faturamento_cartao_total / Receita Líquida anualizada (DRE)",
+        "dependencia_adquirente_formula":    "max(raio_x.market_share_adquirente)",
+        "recebiveis_cartao_divida_formula":  "faturamento_cartao_total / Carteira Ativa SCR",
+        "volatilidade_formula":              "Desvio Padrão / Média da série mensal Agenda (12 meses, raio_x)",
+        "crescimento_formula":               "raio_x.historico_agenda_mensal[-1] / [0] - 1 (YoY mês 12 / mês 0)",
     }
 
 
