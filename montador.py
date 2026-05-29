@@ -406,10 +406,26 @@ def _calcular_red_flags(p3: dict, p2: dict) -> list[dict]:
                  "Resultado financeiro negativo no período mais recente — custo da dívida pressionando o lucro.")
 
     # ── CERC não disponível ──────────────────────────────────────────────
-    if not fontes.get("cerc"):
-        _add("atencao", "CERC",
-             "Não disponível",
-             "Agenda de recebíveis CERC não fornecida — impossível estruturar cessão fiduciária completa.")
+    commercial = p2.get("commercial_inputs") or {}
+    tem_v89 = any(commercial.get(k) for k in ("radar_recebiveis", "agenda_ap005", "raio_x"))
+    tem_v87 = bool(commercial.get("cerc"))
+    if not tem_v89 and not tem_v87:
+        _add("atencao", "commercial_inputs",
+             "Sem CERC nem blocos v8.9 — indicadores de cartão (faturamento_cartao_*, dep_adquirente, etc.) ficarão None",
+             "Solicitar agenda CERC ou enviar Radar/Agenda AP005/Raio-X para o pré-parser determinístico")
+    elif tem_v89:
+        if not commercial.get("raio_x"):
+            _add("atencao", "commercial_inputs.raio_x",
+                 "Sem dashboard CERC 2.0 — sem KPIs exatos de faturamento_cartao_*, market_share e série mensal",
+                 "Verificar se o raio_x.html foi enviado")
+        if not commercial.get("agenda_ap005"):
+            _add("atencao", "commercial_inputs.agenda_ap005",
+                 "Sem agenda futura — sem agenda_futura_constituida/comprometida_cessao",
+                 "Verificar se os CSVs CERC-*_ret_agenda_nova.csv foram enviados")
+        if not commercial.get("radar_recebiveis"):
+            _add("atencao", "commercial_inputs.radar_recebiveis",
+                 "Sem aging — sem indice_comprometimento_radar",
+                 "Verificar se o CSV radar_recebiveis.csv foi enviado")
 
     # ── CPR em carteira (incomum para varejo) ────────────────────────────
     modalidades = scr.get("modalidades_divida", [])
