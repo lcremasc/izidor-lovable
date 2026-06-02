@@ -2080,6 +2080,9 @@ def calcular(p2: dict, p1: dict | None = None) -> dict:
     nuclea     = bureaux.get("nuclea")
     scr_raw    = bureaux.get("scr_bacen")
     cerc_raw   = _get(p2, "commercial_inputs", "cerc")
+    radar      = _get(p2, "commercial_inputs", "radar_recebiveis")  # v8.9
+    agenda_ap  = _get(p2, "commercial_inputs", "agenda_ap005")      # v8.9
+    raio_x     = _get(p2, "commercial_inputs", "raio_x")            # v8.9
 
     # 1. Liquidez
     liquidez = calcular_liquidez(balanco)
